@@ -219,7 +219,7 @@ class RecordingDataProvider(RecordingPathProvider):
         t_diff = pose.tracking_timestamp.total_seconds() * 1e9 - t_ns_device
         return pose, t_diff
 
-    def sample_trajectory_world_device(self, sample_fps: float = 1) -> np.ndarray:
+    def sample_trajectory_world_device(self, sample_fps: float = 1, return_time=False) -> np.ndarray:
         assert self.has_pose, "recording has no closed loop trajectory"
         assert self.has_vrs, "current implementation assume vrs is loaded."
         t_start, t_end = self.get_global_timespan_ns()
@@ -228,13 +228,21 @@ class RecordingDataProvider(RecordingPathProvider):
 
         dt = int(1e9 / sample_fps)
         traj_world_device = []
+        traj_device_time = []
         for t_ns in range(t_start, t_end, dt):
             pose = self.mps_dp.get_closed_loop_pose(t_ns, TimeQueryOptions.CLOSEST)
             traj_world_device.append(
                 pose.transform_world_device.to_matrix().astype(np.float32)
             )
+            traj_device_time.append(
+                int(pose.tracking_timestamp.total_seconds() * 1e9)
+            )
 
         traj_world_device = np.stack(traj_world_device, axis=0)
+        if return_time:
+            traj = np.concatenate((traj_world_device.reshape(-1, 16)[:, :12], 
+                                   np.array(traj_device_time).reshape(-1,1)), axis=0)
+            return traj
         return traj_world_device
 
 

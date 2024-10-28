@@ -40,9 +40,21 @@ class SequencePathProvider:
         )
 
         self.recording_head: Path = rootdir / Subpaths.recording_head
+        if not self.recording_head.exists():
+            self.recording_head = rootdir / f'Nymeria_v0.0_{rootdir.stem}_{Subpaths.recording_head}' / Subpaths.recording_head
+
         self.recording_lwrist: Path = rootdir / Subpaths.recording_lwrist
+        if not self.recording_lwrist.exists():
+            self.recording_lwrist = rootdir / f'Nymeria_v0.0_{rootdir.stem}_{Subpaths.recording_lwrist}' / Subpaths.recording_lwrist
+
         self.recording_rwrist: Path = rootdir / Subpaths.recording_rwrist
+        if not self.recording_rwrist.exists():
+            self.recording_rwrist = rootdir / f'Nymeria_v0.0_{rootdir.stem}_{Subpaths.recording_rwrist}' / Subpaths.recording_rwrist
+            
         self.recording_observer: Path = rootdir / Subpaths.recording_observer
+        if not self.recording_observer.exists():
+            self.recording_observer = rootdir / f'Nymeria_v0.0_{rootdir.stem}_{Subpaths.recording_observer}' / Subpaths.recording_observer
+
 
     def __repr__(self) -> str:
         return (

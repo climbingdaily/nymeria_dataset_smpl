@@ -165,15 +165,16 @@ class NymeriaDataProvider(NymeriaDataProviderConfig):
                 )
         return data
 
-    def get_all_trajectories(self) -> dict[str, np.ndarray]:
+    def get_all_trajectories(self, return_time=False) -> dict[str, np.ndarray]:
         data = {}
         for rec in self.get_existing_recordings():
             if rec.has_vrs and rec.has_pose:
                 data[rec.tag] = rec.sample_trajectory_world_device(
-                    sample_fps=self.trajectory_sample_fps
+                    sample_fps=self.trajectory_sample_fps,
+                    return_time=return_time
                 )
         return data
-
+    
     def get_synced_poses(self, t_ns_global: int) -> dict[str, any]:
         data = {}
         T_Wd_Hd = None
@@ -241,6 +242,7 @@ class NymeriaDataProvider(NymeriaDataProviderConfig):
         if len(self.Ts_Hd_Hx) > 1:
             self.t_ns_align = t_ns[0 :: self.handeye_skip]
         else:
+            logger.info(f"from xsense to aria:\n {self.Ts_Hd_Hx[0].to_matrix()}")
             self.t_ns_align = None
 
     def T_Hd_Hx(self, t_ns: int) -> SE3:

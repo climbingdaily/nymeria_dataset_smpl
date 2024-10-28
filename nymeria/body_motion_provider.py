@@ -7,12 +7,12 @@
 from pathlib import Path
 
 import numpy as np
-import pymomentum as pym
+# import pymomentum as pym
 import torch
 from loguru import logger
 from nymeria.xsens_constants import XSensConstants
 from projectaria_tools.core.sophus import SE3
-from pymomentum.geometry import Character, Mesh
+# from pymomentum.geometry import Character, Mesh
 
 
 class BodyDataProvider:
@@ -37,22 +37,22 @@ class BodyDataProvider:
         self.__correct_quaternion()
 
         # load glb if exist
-        self.character: Character = None
+        self.character = None
         self.motion: np.ndarray = None
-        if Path(glbfile).is_file():
-            self.character, self.motion, _, fps = Character.load_gltf_with_motion(
-                glbfile
-            )
-            assert fps == self.xsens_data[XSensConstants.k_framerate]
-            assert self.motion.shape[0] == self.xsens_data[XSensConstants.k_frame_count]
-            assert self.character.has_mesh
+        # if Path(glbfile).is_file():
+        #     self.character, self.motion, _, fps = Character.load_gltf_with_motion(
+        #         glbfile
+        #     )
+        #     assert fps == self.xsens_data[XSensConstants.k_framerate]
+        #     assert self.motion.shape[0] == self.xsens_data[XSensConstants.k_frame_count]
+        #     assert self.character.has_mesh
 
-    @property
-    def momentum_template_mesh(self) -> Mesh | None:
-        if self.character is not None:
-            return self.character.mesh
-        else:
-            return None
+    # @property
+    # def momentum_template_mesh(self) -> Mesh | None:
+    #     if self.character is not None:
+    #         return self.character.mesh
+    #     else:
+    #         return None
 
     def __correct_timestamps(self) -> None:
         t_original = self.xsens_data[XSensConstants.k_timestamps_us]
