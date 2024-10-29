@@ -197,7 +197,7 @@ class RecordingDataProvider(RecordingPathProvider):
             return True
 
     def get_pose(
-        self, t_ns: int, time_domain: TimeDomain
+        self, t_ns: int, time_domain: TimeDomain, return_diff: bool=False
     ) -> tuple[ClosedLoopTrajectoryPose, int]:
         t_ns = int(t_ns)
         assert self.has_pose, "recording has no closed loop trajectory"
@@ -217,6 +217,8 @@ class RecordingDataProvider(RecordingPathProvider):
 
         pose = self.mps_dp.get_closed_loop_pose(t_ns_device, TimeQueryOptions.CLOSEST)
         t_diff = pose.tracking_timestamp.total_seconds() * 1e9 - t_ns_device
+        if return_diff:
+            return pose, pose.tracking_timestamp.total_seconds() * 1e9 - t_ns
         return pose, t_diff
 
     def sample_trajectory_world_device(self, sample_fps: float = 1, return_time=False) -> np.ndarray:
@@ -241,7 +243,7 @@ class RecordingDataProvider(RecordingPathProvider):
         traj_world_device = np.stack(traj_world_device, axis=0)
         if return_time:
             traj = np.concatenate((traj_world_device.reshape(-1, 16)[:, :12], 
-                                   np.array(traj_device_time).reshape(-1,1)), axis=0)
+                                   np.array(traj_device_time).reshape(-1,1)), axis=1)
             return traj
         return traj_world_device
 

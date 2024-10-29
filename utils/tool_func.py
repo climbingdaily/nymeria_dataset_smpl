@@ -249,38 +249,30 @@ def load_csv_data(rotpath, pospath):
     rot_data = np.asarray(rot_data_csv) # 度
     return pos_data, rot_data, [c.lower() for c in rot_data_csv.columns]
 
-def sync_lidar_mocap(lidar_time, mocap_time, lidar_key_time, mocap_key_time, mocap_frame_time = 0.01):
-    """
-    Given the time stamps of the lidar and mocap data, and the time stamps of the key frames of the
-    lidar and mocap data, the function returns the indices of the lidar and mocap data that correspond
-    to the same time
-    
-    Args:
-      lidar_time: the time stamps of the lidar data
-      mocap_time: the time stamps of the mocap data
-      lidar_key_time: the timestamp of the lidar frame that you want to sync with the mocap data
-      mocap_key_time: the time of the mocap frame that you want to align with the lidar frame
-      mocap_frame_time: the time interval between two consecutive mocap frames
-    """
-    if type(lidar_key_time) == int:
-        lidar_key_time = lidar_time[lidar_key_time]
-    if type(mocap_key_time) == int:
-        mocap_key_time = mocap_time[mocap_key_time]
-        
-    start_time = lidar_key_time - mocap_key_time
-    
-    # 根据lidar的时间戳，选取对应的mocap的帧
-    _lidar_time = lidar_time - start_time
-    _lidar_id = []
-    _mocap_id = []
+def sync_lidar_mocap(a, b, threshold):
+    indices = np.searchsorted(b, a)
 
-    for i, t in enumerate(_lidar_time):
-        tt = abs(mocap_time - t) - mocap_frame_time/2
-        if tt.min() <= 1e-4:
-            _lidar_id.append(i)
-            _mocap_id.append(np.argmin(tt))
-    
-    return _lidar_id, _mocap_id
+    matched_a_indices = []
+    matched_b_indices = []
+
+    for i in range(len(a)):
+        idx = indices[i]
+
+        if idx == 0:
+            closest_b_index = 0
+        elif idx == len(b):
+            closest_b_index = len(b) - 1
+        else:
+            if abs(b[idx - 1] - a[i]) <= abs(b[idx] - a[i]):
+                closest_b_index = idx - 1
+            else:
+                closest_b_index = idx
+
+        if abs(b[closest_b_index] - a[i]) <= threshold + 1e-4:
+            matched_a_indices.append(i)
+            matched_b_indices.append(closest_b_index)
+
+    return np.array(matched_a_indices), np.array(matched_b_indices)
 
 def segment_plane(pointcloud, return_seg = False, planes=4, dist_thresh = 0.1, return_model = False):
     '''> It segments the point cloud into planes, and returns the point cloud that is not a plane

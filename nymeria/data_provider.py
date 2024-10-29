@@ -44,6 +44,9 @@ class NymeriaDataProviderConfig:
     handeye_skip: int = 240 * 5
     handeye_stride: int = 2
 
+    # Parameters
+    return_diff: bool = False
+
 
 class NymeriaDataProvider(NymeriaDataProviderConfig):
     def __init__(self, **kwargs) -> None:
@@ -93,7 +96,7 @@ class NymeriaDataProvider(NymeriaDataProviderConfig):
         self.timespan_ns: tuple[int, int] = self.__get_timespan_ns()
 
         # compute xsens to aria world alignment
-        self.__compute_xsens_to_aria_alignment()
+        self.__compute_xsens_to_aria_alignment(return_diff=self.return_diff)
 
     def get_existing_recordings(self) -> list[RecordingDataProvider]:
         return [
@@ -205,7 +208,7 @@ class NymeriaDataProvider(NymeriaDataProviderConfig):
                 data["momentum"] = skin
         return data
 
-    def __compute_xsens_to_aria_alignment(self) -> None:
+    def __compute_xsens_to_aria_alignment(self, return_diff: bool = False) -> None:
         """
         \brief Compute se3 transform from xsens head to aria head
                This function will set self.Ts_Hd_Hx and self.t_ns_align
@@ -218,6 +221,7 @@ class NymeriaDataProvider(NymeriaDataProviderConfig):
             logger.info("compute alignment from xsens head to aria headset")
             assert self.body_dp is not None
             assert self.recording_head is not None
+            self.t_diff = []
 
         # get synchronized trajectory
         xsens_traj = self.body_dp.get_T_w_h(self.timespan_ns)
@@ -225,8 +229,9 @@ class NymeriaDataProvider(NymeriaDataProviderConfig):
         t_ns: list[int] = xsens_traj[-1]
         T_Wd_Hd: list[SE3] = []
         for t in t_ns:
-            pose, _ = self.recording_head.get_pose(t, TimeDomain.TIME_CODE)
+            pose, t_diff = self.recording_head.get_pose(t, TimeDomain.TIME_CODE, return_diff)
             T_Wd_Hd.append(pose.transform_world_device)
+            self.t_diff.append(t_diff)
 
         # solve handeye
         handeye = HandEyeSolver(
@@ -243,6 +248,7 @@ class NymeriaDataProvider(NymeriaDataProviderConfig):
             self.t_ns_align = t_ns[0 :: self.handeye_skip]
         else:
             logger.info(f"from xsense to aria:\n {self.Ts_Hd_Hx[0].to_matrix()}")
+            self.t_diff = np.array(self.t_diff)
             self.t_ns_align = None
 
     def T_Hd_Hx(self, t_ns: int) -> SE3:
