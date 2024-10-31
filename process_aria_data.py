@@ -6,16 +6,16 @@ from os.path import dirname, split, abspath
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 from scipy.spatial.transform import Rotation as R
 
 import configargparse
-from sympy import true
+from projectaria_tools.core.sophus import SE3
 
 sys.path.append(dirname(split(abspath( __file__))[0]))
 
 from nymeria.data_provider import NymeriaDataProvider
-from utils import poses_to_joints, mocap_to_smpl_axis, sync_lidar_mocap
+from nymeria.handeye import HandEyeSolver
+from utils import poses_to_joints, mocap_to_smpl_axis, sync_lidar_mocap, poses_to_vertices_torch
 from utils import save_json_file, read_json_file, load_csv_data, print_table, compute_similarity
 
 field_fmts = ['%d', '%.6f', '%.6f', '%.6f', '%.6f', '%.6f', '%.6f', '%.6f', '%.3f']
@@ -35,9 +35,9 @@ def save_trajs(save_dir, rot, pos, mocap_id, comments='first', framerate=100):
 
     print('Save traj in: ', save_file)
 
-    return t 
+    return t
 
-def finetune_first_person_data(synced_data_file):
+def finetune_first_person_data(synced_data_file, sensor_traj):
     """
     > It takes the head sensor trajectory and the parameter file, 
       and then it saves the LiDAR trajectory in the parameter file
@@ -50,46 +50,81 @@ def finetune_first_person_data(synced_data_file):
         fp_data = save_data['first_person']
         first_pose = fp_data['pose'].copy()
         mocap_tran = fp_data['mocap_trans'].copy()
-        sensor_traj = fp_data['lidar_traj'].copy() 
+
+        fp_data['lidar_traj'] = sensor_traj
 
         try:
-            j = poses_to_joints(first_pose)
+            _, j, glo_rot = poses_to_vertices_torch(first_pose, mocap_tran)
         except:
-            j = poses_to_joints(first_pose, is_cuda=False, batch_size=1024)
+            _, j, glo_rot = poses_to_vertices_torch(first_pose, mocap_tran, is_cuda=False)
 
+        # save smpl head trajectory
         smpl_head_traj = np.concatenate((save_data['frame_num'].reshape(-1, 1), 
-                                            j[:, 15] + mocap_tran), axis=1)
+                                            j[:, 15]), axis=1)
         smpl_head_traj_path = os.path.join(os.path.dirname(synced_data_file), 'smpl_head_trajectory.txt')
         np.savetxt(smpl_head_traj_path, smpl_head_traj)
         print(f'Saved initial smpl head trajectory to {smpl_head_traj_path}')
         
-        root_to_head = j[:, 15] - j[:, 0]
+        head_to_root = (j[:, 0] - j[:, 15]).cpu().numpy()
 
-        data_lenght = len(mocap_tran)
+        ROT, _, _ = compute_similarity(j[:len(mocap_tran)//2, 15, :2].numpy(), 
+                                       sensor_traj[:len(mocap_tran)//2, 1:3])
 
-        ROT, _, _ = compute_similarity(
-            mocap_tran[:data_lenght//2, :2] + root_to_head[:data_lenght//2, :2], 
-            sensor_traj[:data_lenght//2, 1:3])
-        
         delta_degree = np.linalg.norm(R.from_matrix(ROT).as_rotvec()) * 180 / np.pi
         print(f'[First person] {delta_degree:.1f}° around Z-axis from the mocap to LiDAR data.')
 
         scaled_trans = mocap_tran @ ROT.T
-        scaled_trans -= scaled_trans[0] - mocap_tran[0] # move to the start position
+        scaled_trans = (scaled_trans - scaled_trans[0]) + (sensor_traj[0, 1:4] + head_to_root[0]) # move to the sensor start position
 
-        first_pose[:, :3] = (R.from_matrix(
-            ROT) * R.from_rotvec(first_pose[:, :3])).as_rotvec()
+        first_pose[:, :3] = (R.from_matrix(ROT) * R.from_rotvec(first_pose[:, :3])).as_rotvec()
 
-        joints, verts = poses_to_joints(first_pose[:1], return_verts=True, is_cuda=False) 
-        feet_center = (joints[0, 7] + joints[0, 8])/2
-        feet_center[2] = verts[..., 2].min()
-        scaled_trans -= scaled_trans[0] + feet_center  # 使得第一帧位于原点
-
-        fp_data['origin_trans'] = fp_data['mocap_trans'].copy()
-        fp_data['origin_pose'] = fp_data['pose'].copy()
-        fp_data['lidar_traj'] = sensor_traj
         fp_data['mocap_trans'] = scaled_trans
+        fp_data['mocap_pose'] = first_pose.copy()
+
+        # joints, verts = poses_to_joints(first_pose[:1], return_verts=True, is_cuda=False) 
+        # feet_center = (joints[0, 7] + joints[0, 8])/2
+        # feet_center[2] = verts[..., 2].min()
+        # scaled_trans -= scaled_trans[0] + feet_center  # 
+
+        # solve handeye (eye in the hand)
+        handeye = HandEyeSolver(
+            stride=2,
+            smooth=False,
+            skip=30 * 5,
+            window=30 * 120,
+        )
+        
+        aria_se3 = SE3.from_quat_and_translation(
+            sensor_traj[:, 7], 
+            sensor_traj[:, 4:7], 
+            sensor_traj[:, 1:4]
+        )
+        
+        smpl_head_se3 = SE3.from_quat_and_translation(
+            R.from_matrix(ROT @ glo_rot[:, 15].numpy()).as_quat()[:, 3], 
+            R.from_matrix(ROT @ glo_rot[:, 15].numpy()).as_quat()[:, :3], 
+            scaled_trans
+        )
+
+        Ts_Hd_Hx: list[SE3] = handeye(
+            T_Wa_A=aria_se3,
+            T_Wb_B=smpl_head_se3,
+        )
+        print(f"from xsense (smpl head) to aria head:\n {Ts_Hd_Hx[0].to_matrix()}")
+
+        head_to_aria = Ts_Hd_Hx[0].to_matrix()  # 4*4
+
+
+        # head_world_rot = R.from_matrix(ROT @ glo_rot[:, 15].numpy())
+        # root_world_rot = R.from_matrix(ROT @ glo_rot[:, 0].numpy())
+        # new_root_rot = R.from_matrix(new_head_trans[:, :3, :3]) * head_world_rot.inv() * root_world_rot 
+        # first_pose[:, :3] = new_root_rot.as_rotvec()
+        new_head_trans = aria_se3.to_matrix() @ head_to_aria
+        fp_data['trans'] = new_head_trans[:, :3, 3] + head_to_root
         fp_data['pose'] = first_pose
+        fp_data['mocap_trans'] = (scaled_trans - scaled_trans[0]) + (new_head_trans[0, :3, 3] + head_to_root[0])
+
+        fp_data['head_to_aria'] = head_to_aria.tolist()
 
     else:
         save_data['first_person'] = {'lidar_traj': sensor_traj}
@@ -97,14 +132,6 @@ def finetune_first_person_data(synced_data_file):
     with open(synced_data_file, "wb") as f:
         pickle.dump(save_data, f)
         print(f"File saved in {synced_data_file}")
-
-
-def check_sync_valid(keytime_a, keytime_b, min_time_gap = 50, offset=1.5):
-    gap_time = abs(keytime_a[-1] - keytime_a[0]) - abs(keytime_b[-1] - keytime_b[0])
-    if keytime_a[-1] - keytime_a[0] > min_time_gap and abs(gap_time) < offset:
-        return True, gap_time
-    else:
-        return False, 0
 
 def make_sensor_params(sensor, gap_frame):
     info = f"{sensor['syncid'][gap_frame]} ({sensor['times'][sensor['syncid'][gap_frame]]}s) " if gap_frame>0 else gap_frame
@@ -213,19 +240,9 @@ def save_sync_data(root_folder, head_traj, body_data, start=0, end=np.inf, gap_f
             keyid.append(np.where(abs(sensor['times'] - kt) < 0.85/sensor['framerate'])[0][-1])
         return keyid
     
-    # if len(dataset_params['lidar_sync']) > 0 and len(dataset_params['mocap_sync']) > 0:
     if True:
-        # sensor['keytime']  = dataset_params['lidar_sync']   # lidar keytime for synchronization
-        # mocap['keytime']  = dataset_params['mocap_sync']   # mocap keytime for synchronization
-        # sensor['keyid'] =  get_keyid(lidar)
-        # mocap['keyid'] =  get_keyid(mocap)
-
-        # double_sync, gap_time = check_sync_valid(sensor['keytime'], mocap['keytime'])
-        # print(f'Reletive keytime offset: {-gap_time:.3f}\n')
     
-        # 1. sync. data
         sensor['syncid'], mocap['syncid'] = sync_lidar_mocap(sensor['times'], mocap['times'], 0.5/mocap['framerate'])
-        # 2 choose start time
         if 'start' in dataset_params:
             start =  dataset_params['start']
         else:
@@ -271,20 +288,10 @@ def save_sync_data(root_folder, head_traj, body_data, start=0, end=np.inf, gap_f
         j, v  = poses_to_joints(sync_pose[:1], return_verts=True, is_cuda=False) 
         feet_center    = (j[0, 7] + j[0, 8])/2
         feet_center[2] = v[..., 2].min()
-        trans      -= trans[0] + feet_center  # 使得第一帧位于原点
+        trans      -= trans[0] + feet_center
 
         # 3. save synced data
         update_data(save_data, 'first', trans, sync_pose)
-
-        # 4. save the head trajectory if it doesn't exist (for comparison)
-        if not os.path.exists(os.path.join(root_folder, 'smpl_head_trajectory.txt')):
-            j = poses_to_joints(sync_pose, return_verts=False, is_cuda=False) 
-            smpl_head_traj = np.concatenate((mocap['syncid'].reshape(-1, 1), 
-                                             j[:, 15] + trans, 
-                                             mocap['times'][mocap['syncid']].reshape(-1, 1)), axis=1)
-            np.savetxt(os.path.join(root_folder, 'smpl_head_trajectory.txt'), smpl_head_traj)
-            print(f'Saved initial smpl head trajectory to {os.path.join(root_folder, "smpl_head_trajectory.txt")}')
-
 
     if second_data:
         fix_orit = True if not first_data else False
@@ -308,26 +315,6 @@ def save_sync_data(root_folder, head_traj, body_data, start=0, end=np.inf, gap_f
         print(f"File saved in {param_file}")
     
     return sync_pose, trans, sensor['syncid'], param_file   # type: ignore
-
-def add_lidar_traj(synced_data_file, lidar_traj):
-    """
-    It takes a synced data file and a lidar trajectory, and saves the lidar trajectory in the synced
-    data file
-    
-    Args:
-      synced_data_file: the file that contains the synced data
-      lidar_traj: a list of lidar poses, each of which is a list of [ID, x, y, z, qx, qy, qz, qw, timestamp]
-    """
-
-    with open(synced_data_file, "rb") as f:
-        save_data = pickle.load(f)
-
-    save_data['first_person'] = {'lidar_traj': lidar_traj}
-
-    with open(synced_data_file, "wb") as f:
-        pickle.dump(save_data, f)
-        print(f"Lidar traj saved in {synced_data_file}")
-
 
 if __name__ == '__main__':
     parser = configargparse.ArgumentParser()
@@ -402,9 +389,11 @@ if __name__ == '__main__':
     aria_points = nd_lodaer.get_all_pointclouds()
     head_traj = aria_trajs['recording_head']
     head_pc = aria_points['recording_head']
-
+    for tag, pc in aria_points.items():
+        save_path = os.path.join(root_folder, 'body', f'pc_{tag}.txt')
+        np.savetxt(save_path, pc)
+        
     # aria_poses = nd_lodaer.get_synced_poses()
-    save_path = os.path.join(os.path.dirname(traj_file), 'head_pc.txt')
     save_path = os.path.join(os.path.dirname(traj_file), 'head_trajectory.txt')
     np.savetxt(save_path, head_traj)
     print(f"Aria glassed Head trajectory saved in {save_path}")
@@ -414,7 +403,7 @@ if __name__ == '__main__':
 
     nd_lodaer.body_dp.xsens_data['index_span'] = [start, end]
     nd_lodaer.body_dp.xsens_data['t_diff'] = nd_lodaer.t_diff       # from xsense to head glasses
-    nd_lodaer.body_dp.xsens_data['Ts_Hd_Hx'] = nd_lodaer.Ts_Hd_Hx[0].to_matrix()       # from xsense to head glasses
+    # nd_lodaer.body_dp.xsens_data['Ts_Hd_Hx'] = nd_lodaer.Ts_Hd_Hx[0].to_matrix()       # from xsense to head glasses
 
     args.end_idx = min(args.end_idx, head_traj.shape[0])
 
@@ -428,32 +417,4 @@ if __name__ == '__main__':
         start = args.start_idx, 
         end   = args.end_idx)
     
-    finetune_first_person_data(synced_data_file)
-
-    # ----------------------------------------------------------------
-    # compute hand-eye coordinates for     
-    
-    # --------------------------------------------
-    # 3. Use TSDF fusion to build the scene mesh
-    # --------------------------------------------
-    # mapping_start, mapping_end = frameids[0] + 100, frameids[-1] - 100
-    # if args.tsdf:
-    #     kitti_poses = traj_to_kitti_main(lidar_traj, args.start_idx, args.end_idx)
-    #     vdbf = VDBFusionPipeline(lidar_dir, 
-    #                             traj_to_kitti_main(lidar_traj, mapping_start, mapping_end), 
-    #                             start         = mapping_start,
-    #                             end           = mapping_end,
-    #                             map_name      = os.path.basename(root_folder),
-    #                             sdf_trunc     = args.sdf_trunc,
-    #                             voxel_size    = args.voxel_size, 
-    #                             space_carving = True)
-    #     vdbf.run(skip=args.skip_frame)
-    #     try:
-    #         vdbf.segment_ground()
-    #     except Exception as e:
-    #         print(e.args[0])
-
-# python process_raw_data.py --root_folder <root folder> [--tsdf] [--sync]
-# --tsdf,         building the scene mesh
-# --sync,         synchronize lidar and imu
-# --voxel_size,   The voxel filter parameter for TSDF fusion
+    finetune_first_person_data(synced_data_file, head_traj[frameids])
