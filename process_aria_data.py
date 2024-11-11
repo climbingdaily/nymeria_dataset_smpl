@@ -408,7 +408,7 @@ if __name__ == '__main__':
     args.end_idx = min(args.end_idx, head_traj.shape[0])
 
     # --------------------------------------------
-    # 2. Synchronize the LiDAR and mocap data.
+    # 2. Synchronize the Aria and mocap data.
     # --------------------------------------------
     _, _, frameids, synced_data_file = save_sync_data(
         root_folder, 
