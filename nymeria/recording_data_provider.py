@@ -189,6 +189,41 @@ class RecordingDataProvider(RecordingPathProvider):
 
         return image_data, image_meta, t_diff
 
+    def get_stereo_image(
+        self, t_ns: int, time_domain: TimeDomain = TimeDomain.TIME_CODE
+    ) -> tuple[ImageData, ImageDataRecord, int]:
+        assert self.has_rgb, "recording has no rgb video"
+        assert time_domain in [
+            TimeDomain.DEVICE_TIME,
+            TimeDomain.TIME_CODE,
+        ], "unsupported time domain"
+
+        if time_domain == TimeDomain.TIME_CODE:
+            t_ns_device = self.vrs_dp.convert_from_timecode_to_device_time_ns(
+                timecode_time_ns=t_ns
+            )
+        else:
+            t_ns_device = t_ns
+
+        # left image
+        left_image_data, left_image_meta = self.vrs_dp.get_image_data_by_time_ns(
+            StreamId("1201-1"),
+            time_ns=t_ns_device,
+            time_domain=TimeDomain.DEVICE_TIME,
+            time_query_options=TimeQueryOptions.CLOSEST,
+        )
+        t_diff = t_ns_device - left_image_meta.capture_timestamp_ns
+
+        right_image_data, right_image_meta = self.vrs_dp.get_image_data_by_time_ns(
+            StreamId("1201-2"),
+            time_ns=t_ns_device,
+            time_domain=TimeDomain.DEVICE_TIME,
+            time_query_options=TimeQueryOptions.CLOSEST,
+        )
+        t_diff = t_ns_device - right_image_meta.capture_timestamp_ns
+
+        return left_image_data, right_image_data, t_diff
+
     @property
     def has_pose(self) -> bool:
         if self.mps_dp is None or not self.mps_dp.has_closed_loop_poses():

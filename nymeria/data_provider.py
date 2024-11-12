@@ -148,6 +148,34 @@ class NymeriaDataProvider(NymeriaDataProviderConfig):
             data[rec.tag] = result
         return data
 
+    def get_stereo_videos(self, t_ns_global: int) -> dict[str, any]:
+        rec = self.recording_head
+        if rec is None and not rec.has_rgb:
+            return None
+
+        result_stereo = rec.get_stereo_image(t_ns_global, time_domain=TimeDomain.TIME_CODE)
+        result_rgb    = rec.get_rgb_image(t_ns_global, time_domain=TimeDomain.TIME_CODE)
+
+        if abs(result_stereo[-1] / 1e6) > 33:  # 33ms
+            logger.warning(f"time difference for stereo image query: {result_stereo[-1]} ms")
+        if abs(result_rgb[-1] / 1e6) > 33:  # 33ms
+            logger.warning(f"time difference for stereo image query: {result_rgb[-1]} ms")
+        return result_stereo, result_rgb
+    
+    def get_stereo_by_order(self, ) -> dict[str, any]:
+        data = {}
+        rec = self.recording_head
+        if rec is None and not rec.has_rgb:
+            return None
+
+        result_stereo = rec.get_stereo_image(t_ns_global, time_domain=TimeDomain.TIME_CODE)
+
+        if abs(result_stereo[-1] / 1e6) > 33:  # 33ms
+            logger.warning(f"time difference for stereo image query: {result_stereo[-1]} ms")
+        if abs(result_rgb[-1] / 1e6) > 33:  # 33ms
+            logger.warning(f"time difference for stereo image query: {result_rgb[-1]} ms")
+        return result_stereo, result_rgb
+
     def get_all_pointclouds(self) -> dict[str, np.ndarray]:
         data = {}
         for rec in self.get_existing_recordings():
