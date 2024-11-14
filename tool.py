@@ -9,11 +9,13 @@ import numpy as np
 import configargparse
 from PIL import Image
 import cv2
+import open3d as o3d
 
 import projectaria_tools.core.mps as mps
 from projectaria_tools.core.sophus import SE3
 from projectaria_tools.core import data_provider, calibration
 from projectaria_tools.core.data_provider import VrsDataProvider
+from projectaria_tools.core.mps.utils import get_nearest_pose, filter_points_from_confidence
 from projectaria_tools.core.stream_id import StreamId
 from projectaria_tools.core.sensor_data import (
     ImageData,
@@ -177,21 +179,54 @@ def undistort_image(input_img, new_calib, input_calib, label=""):
     cv2.imshow(f"Undistored {label}", np.rot90(undistorted_img, -1))
     return undistorted_img
 
+def load_point_cloud(points_path:str, save_pc_path:str, inv_dist_std: float=0.0006, dist_std: float=0.01, voxel_size=0.01):
+    pts = mps.read_global_point_cloud(points_path)
+    filtered_points = filter_points_from_confidence(pts, inv_dist_std, dist_std)
+    pts = []
+    for p in filtered_points:
+        pts.append(p.position_world.astype(np.float32))
+    pts = np.stack(pts)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts)
+    pcd = pcd.voxel_down_sample(voxel_size=voxel_size)  # remove the duplicate points
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2)
+    o3d.io.write_point_cloud(save_pc_path, pcd)
+
+    print(f"{len(pcd.points)} points after filtering.")
+    return pcd 
+
+
 if __name__ == '__main__':
     parser = configargparse.ArgumentParser()
 
     parser.add_argument("--root_folder", type=str, 
-                        default="/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd",
+                        # default="/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd",
+                        default="D:\\Data\\20231222_s1_kenneth_fischer_act7_56uvqd",
                         help="The data's root directory")
 
     args, opts    = parser.parse_known_args()
     root_folder   = args.root_folder
-
     head_f        = glob(root_folder + '/*head')[0]
 
     online_calib_path = os.path.join(head_f, 'mps', 'slam', 'online_calibration.jsonl')
-    traj_file     = os.path.join(head_f, 'mps', 'slam', 'closed_loop_trajectory.csv')
-    vrsfile       = os.path.join(head_f, 'data', 'data.vrs')
+    closed_loop_path  = os.path.join(head_f, 'mps', 'slam', 'closed_loop_trajectory.csv')
+    glo_points_path   = os.path.join(head_f, 'mps', 'slam', 'semidense_points.csv.gz')
+    observations_path = os.path.join(head_f, 'mps', 'slam', 'semidense_observations.csv.gz')
+    
+    vrsfile           = os.path.join(head_f, 'data', 'data.vrs')
+
+    save_pc_path      = os.path.join(root_folder, 'body', 'pc_head.ply')
+
+    observations = mps.read_point_observations(observations_path)
+
+    # Goal: To have the UV pixel and corresponding points and frame number
+    # todo: 1. read uid, camera, and uv of this observation
+    # 2. get the point cloud from the uid in raw points cloud
+    # 3. determine the frame number based on the graph_uid in closed loop traj fiel
+
+    closed_loop_traj = mps.read_closed_loop_trajectory(closed_loop_path)
+    points = load_point_cloud(glo_points_path, save_pc_path)
+
 
     stream_mappings = {
         "camera-slam-left": StreamId("1201-1"),
@@ -199,6 +234,10 @@ if __name__ == '__main__':
         "camera-rgb": StreamId("214-1"),
         # "camera-eyetracking": StreamId("211-1"),
     }
+    
+    # filter the point cloud using thresholds on the inverse depth and distance standard deviation
+    inverse_distance_std_threshold = 0.001
+    distance_std_threshold = 0.15
 
     online_calibs = mps.read_online_calibration(online_calib_path)
     provider: VrsDataProvider = data_provider.create_vrs_data_provider(vrsfile)
@@ -218,8 +257,11 @@ if __name__ == '__main__':
         240, "camera-rgb",rgb_cam_calib.get_transform_device_camera())
 
     for calib in online_calibs[240*80: -240*8]:
-        l, r, rgb = get_stereo_image(provider, int(calib.tracking_timestamp.total_seconds()*1e9), TimeDomain.DEVICE_TIME)
-        
+        query_timestamp_ns = int(calib.tracking_timestamp.total_seconds()*1e9)
+        l, r, rgb = get_stereo_image((provider, query_timestamp_ns), TimeDomain.DEVICE_TIME)
+
+        transform_world_device = get_nearest_pose(closed_loop_traj, query_timestamp_ns).transform_world_device # device to world coordinates
+
         calib_l     = calib.camera_calibs[0] # left camera calibration
         calib_r     = calib.camera_calibs[1]  # right camera calibration
         calib_rgb   = calib.camera_calibs[2] # rgb camera calibration
