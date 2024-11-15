@@ -51,7 +51,7 @@ def get_stereo_image(vrs_dp, t_ns: int, time_domain: TimeDomain = TimeDomain.TIM
         time_domain=TimeDomain.DEVICE_TIME,
         time_query_options=TimeQueryOptions.CLOSEST,
     )
-
+    t_diff = t_ns_device - right_image_meta.capture_timestamp_ns
 
     image_data, image_meta = vrs_dp.get_image_data_by_time_ns(
         StreamId("214-1"),
@@ -62,7 +62,7 @@ def get_stereo_image(vrs_dp, t_ns: int, time_domain: TimeDomain = TimeDomain.TIM
 
     t_diff = t_ns_device - right_image_meta.capture_timestamp_ns
 
-    return left_image_data, right_image_data, image_data
+    return left_image_data, left_image_meta, right_image_data, right_image_meta, image_data, image_meta
 
 def get_intrinsic_from_calib(calib):
     cam = np.eye(3)
@@ -186,8 +186,10 @@ if __name__ == '__main__':
 
     args, opts    = parser.parse_known_args()
     root_folder   = args.root_folder
-
     head_f        = glob(root_folder + '/*head')[0]
+    image_folder  = os.path.join(head_f, "images")
+    if not os.path.exists(image_folder):
+        os.makedirs(image_folder)
 
     online_calib_path = os.path.join(head_f, 'mps', 'slam', 'online_calibration.jsonl')
     traj_file     = os.path.join(head_f, 'mps', 'slam', 'closed_loop_trajectory.csv')
@@ -217,8 +219,10 @@ if __name__ == '__main__':
         480, 
         240, "camera-rgb",rgb_cam_calib.get_transform_device_camera())
 
+
     for calib in online_calibs[240*80: -240*8]:
-        l, r, rgb = get_stereo_image(provider, int(calib.tracking_timestamp.total_seconds()*1e9), TimeDomain.DEVICE_TIME)
+        device_time = calib.tracking_timestamp.total_seconds()
+        l, _, r, _, rgb, _ = get_stereo_image(provider, int(device_time*1e9), TimeDomain.DEVICE_TIME)
         
         calib_l     = calib.camera_calibs[0] # left camera calibration
         calib_r     = calib.camera_calibs[1]  # right camera calibration
@@ -231,12 +235,14 @@ if __name__ == '__main__':
         left_img    = cv2.cvtColor(l.to_numpy_array(), cv2.COLOR_GRAY2RGB)
         right_img   = cv2.cvtColor(r.to_numpy_array(), cv2.COLOR_GRAY2RGB)
         rgb_img     = cv2.cvtColor(rgb.to_numpy_array(), cv2.COLOR_BGR2RGB)
-
-        # l_image = Image.fromarray(l.to_numpy_array())
         
         undistorted_left  = undistort_image(left_img, left_new_calib, calib_l, "left")
         undistorted_right = undistort_image(right_img, right_new_calib, calib_r, "right")
         undistorted_rgb   = undistort_image(rgb_img, pinhole_rgb, rgb_cam_calib, "rgb")
+
+        Image.fromarray(np.rot90(cv2.cvtColor(undistorted_left, cv2.COLOR_RGB2BGR), -1)).save(os.path.join(image_folder, f"{device_time}_left.png"))
+        Image.fromarray(np.rot90(cv2.cvtColor(undistorted_right, cv2.COLOR_RGB2BGR), -1)).save(os.path.join(image_folder, f"{device_time}_right.png"))
+        Image.fromarray(np.rot90(cv2.cvtColor(undistorted_rgb, cv2.COLOR_RGB2BGR), -1)).save(os.path.join(image_folder, f"{device_time}_rgb.png"))
 
         # compute_depth_from_undistorted(undistorted_left, undistorted_right, left_new_calib, right_new_calib)
         compute_depth_from_undistorted(undistorted_left, undistorted_right, left_new_calib, right_new_calib, "stereo")
