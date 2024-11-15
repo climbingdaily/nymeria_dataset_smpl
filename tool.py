@@ -4,12 +4,15 @@ from glob import glob
 import pickle
 from os.path import dirname, split, abspath
 from pathlib import Path
+import time 
 
 import numpy as np
 import configargparse
 from PIL import Image
 import cv2
 import open3d as o3d
+import matplotlib
+from tqdm import tqdm
 
 import projectaria_tools.core.mps as mps
 from projectaria_tools.core.sophus import SE3
@@ -67,7 +70,7 @@ def get_stereo_image(vrs_dp: VrsDataProvider, t_ns: int, time_domain: TimeDomain
     return left_image_data, left_image_meta, right_image_data, right_image_meta, image_data, image_meta
 
 def get_intrinsic_from_calib(calib):
-    cam = np.eye(3)
+    cam = np.eye(3).astype(np.float32)
     cam[0, 0] = calib.get_focal_lengths()[0]
     cam[1, 1] = calib.get_focal_lengths()[1]
     cam[0, 2] = calib.get_principal_point()[0]
@@ -173,10 +176,11 @@ def get_updated_calib(input_calib, label=""):
         label,
         input_calib.get_transform_device_camera())
 
-def undistort_image(input_img, new_calib, input_calib, label=""):
+def undistort_image(input_img, new_calib, input_calib, label="", is_show=False):
     undistorted_img = calibration.distort_by_calibration(input_img, new_calib, input_calib)
-    cv2.imshow(label, np.rot90(input_img, -1))
-    cv2.imshow(f"Undistored {label}", np.rot90(undistorted_img, -1))
+    if is_show:
+        cv2.imshow(label, np.rot90(input_img, -1))
+        cv2.imshow(f"Undistored {label}", np.rot90(undistorted_img, -1))
     return undistorted_img
 
 def load_point_cloud(points_path:str, save_pc_path:str, inv_dist_std: float=0.0006, dist_std: float=0.01, voxel_size=0.01):
@@ -195,72 +199,68 @@ def load_point_cloud(points_path:str, save_pc_path:str, inv_dist_std: float=0.00
     print(f"{len(pcd.points)} points after filtering.")
     return pcd, raw_pts
 
-def assign_frame_indices(observations, closed_loop_traj):
-    """
-    为observations中的每个点分配其在closed_loop_traj中的帧索引
-    """
-    frame_index = []
-    for obs in observations:
-        idx = bisection_timestamp_search(closed_loop_traj, obs.frame_capture_timestamp.total_seconds() * 1e9)
-        frame_index.append(idx)
-    return frame_index
+def project_point_cloud_to_image(pointcloud, calib, extrnsics):
     
-def process_large_observations(observations, points, closed_loop_traj, online_calibs):
-    """
-    优化处理大规模观测点，将UV点按序号归类到每帧，并投影计算深度。
-    """
-    frame_indices  = assign_frame_indices(observations, closed_loop_traj)
+    points = np.asarray(pointcloud.points).astype(np.float32)
+    w, h  = calib.get_image_size()
+    intrinsic_matrix = get_intrinsic_from_calib(calib)
+    R = extrnsics[:3, :3].astype(np.float32) # (3, 3)
+    T = extrnsics[:3, 3:].astype(np.float32) # (3,3)
 
-    # 初始化帧结果存储
-    frame_uv_points = {idx: [] for idx in range(len(closed_loop_traj))}
+    camera_coordinates = R.dot(points.T) + T    # (3, n)
 
-    # 按帧分组UV点
-    for obs, frame_idx in zip(observations, frame_indices):
-        frame_uv_points[frame_idx].append(obs)
+    z = camera_coordinates[2, :]
+    valid_points = z > 0 
 
-    # 逐帧处理
-        # 逐帧处理
-    for frame_idx, frame_points in frame_uv_points.items():
-        if not frame_points:
-            continue  # 跳过没有观测点的帧
-        
-        for obs in frame_points:
-            uid = obs.point_uid
-            point_3d = find_point_3d(uid, points)
-            if point_3d is not None:
-                projected_uv, depth = project_3d_to_2d(point_3d, camera_intrinsics, camera_extrinsics)
-                observed_uv = obs.uv.flatten()  # 获取观测的UV
-                print(f"  UID {uid}: Observed UV: {observed_uv}, Projected UV: {projected_uv}, Depth: {depth}")
-            else:
-                print(f"  UID {uid}: Point not found in 3D points.")
+    uv = intrinsic_matrix @ camera_coordinates[:, valid_points]
+    u, v = uv[0, :] / uv[2, :], uv[1, :] / uv[2, :]
 
-def find_point_3d(uid, points):
-    """
-    根据uid从points中查找3D点（已排序情况下优化查找）。
-    """
-    for pt in points:
-        if pt.uid == uid:
-            return pt.position_world.flatten()  # 返回3D点的numpy数组
-    return None
+    valid_uv = (u > 0) & (u < w) & (v > 0) & (v < h)
 
-def project_3d_to_2d(point_3d, camera_intrinsics, camera_extrinsics):
-    """
-    将3D点投影到2D像素平面
-    """
-    point_3d_h = np.append(point_3d, 1.0)
-    camera_coord = camera_extrinsics @ point_3d_h
-    depth = camera_coord[2]
-    pixel_coord_h = camera_intrinsics @ camera_coord[:3]
-    u = pixel_coord_h[0] / pixel_coord_h[2]
-    v = pixel_coord_h[1] / pixel_coord_h[2]
-    return (u, v), depth
+    return u[valid_uv], v[valid_uv], z[valid_points][valid_uv]
+
+def remove_farther_points_and_color(us, vs, zs, image_width, image_height):
+
+    assert len(us) == len(vs) == len(zs), "Unexpected number of points for uv pairs."
+
+    depth = np.zeros((image_height, image_width)).astype(np.float32)
+
+    # 遍历所有投影点
+    for u, v, z in zip(us, vs, zs):
+        u_int, v_int = int(u), int(v)
+
+        if 0 <= u_int < image_width and 0 <= v_int < image_height:
+
+            if depth[v_int, u_int] == 0 or z < depth[v_int, u_int]:
+                depth[v_int, u_int] = z
+    
+    return depth
+
+def overlay_depth_on_image(original_image, depth, min_d = 0.8, max_d = 30):
+    if original_image.shape[:2] != depth.shape[:2]:
+        raise ValueError("Original image and color image must have the same dimensions")
+    
+    cmap = matplotlib.colormaps.get_cmap('Spectral_r')
+    
+    mask = (depth > min_d) & (depth < max_d)
+
+    depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
+    depth = depth.astype(np.uint8)
+    depth_image = (cmap(depth)[:, :, :3] * 255).astype(np.uint8)
+
+    overlay_image = original_image.copy()
+    overlay_image[mask] = depth_image[mask]
+
+    depth_image[~mask] = 0
+
+    return overlay_image, depth_image
 
 if __name__ == '__main__':
     parser = configargparse.ArgumentParser()
 
     parser.add_argument("--root_folder", type=str, 
-                        # default="/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd",
-                        default="D:\\Data\\20231222_s1_kenneth_fischer_act7_56uvqd",
+                        default="/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd",
+                        # default="D:\\Data\\20231222_s1_kenneth_fischer_act7_56uvqd",
                         help="The data's root directory")
 
     args, opts    = parser.parse_known_args()
@@ -288,9 +288,9 @@ if __name__ == '__main__':
     online_calibs = mps.read_online_calibration(online_calib_path)
     closed_loop_traj = mps.read_closed_loop_trajectory(closed_loop_path)
     pcd, raw_points = load_point_cloud(glo_points_path, save_pc_path)
-    observations = mps.read_point_observations(observations_path)
+    # observations = mps.read_point_observations(observations_path)
     
-    process_large_observations(observations, raw_points, closed_loop_traj, online_calibs)
+    # process_large_observations(observations, raw_points, closed_loop_traj, online_calibs)
 
     stream_mappings = {
         "camera-slam-left": StreamId("1201-1"),
@@ -299,10 +299,6 @@ if __name__ == '__main__':
         # "camera-eyetracking": StreamId("211-1"),
     }
     
-    # filter the point cloud using thresholds on the inverse depth and distance standard deviation
-    inverse_distance_std_threshold = 0.001
-    distance_std_threshold = 0.15
-
     provider: VrsDataProvider = data_provider.create_vrs_data_provider(vrsfile)
 
     # left_config = provider.get_image_configuration(StreamId("1201-1"))
@@ -315,13 +311,15 @@ if __name__ == '__main__':
 
 
     pinhole_rgb = calibration.get_linear_camera_calibration(
-        480, 
-        480, 
+        512, 
+        512, 
         240, "camera-rgb",rgb_cam_calib.get_transform_device_camera())
 
-
-    for calib in online_calibs[240*80: -240*8]:
+    for calib in tqdm(online_calibs[240*80: -240*8], desc="Processing"):
         device_time = calib.tracking_timestamp.total_seconds()
+        globa_pose  = get_nearest_pose(closed_loop_traj, int(device_time*1e9))
+        globa_pose.transform_world_device.to_matrix()
+
         l, _, r, _, rgb, _ = get_stereo_image(provider, int(device_time*1e9), TimeDomain.DEVICE_TIME)
         
         calib_l     = calib.camera_calibs[0] # left camera calibration
@@ -340,30 +338,43 @@ if __name__ == '__main__':
         undistorted_right = undistort_image(right_img, right_new_calib, calib_r, "right")
         undistorted_rgb   = undistort_image(rgb_img, pinhole_rgb, rgb_cam_calib, "rgb")
 
-        Image.fromarray(np.rot90(cv2.cvtColor(undistorted_left, cv2.COLOR_RGB2BGR), -1)).save(os.path.join(image_folder, f"{device_time}_left.png"))
-        Image.fromarray(np.rot90(cv2.cvtColor(undistorted_right, cv2.COLOR_RGB2BGR), -1)).save(os.path.join(image_folder, f"{device_time}_right.png"))
-        Image.fromarray(np.rot90(cv2.cvtColor(undistorted_rgb, cv2.COLOR_RGB2BGR), -1)).save(os.path.join(image_folder, f"{device_time}_rgb.png"))
+        # Image.fromarray(np.rot90(cv2.cvtColor(undistorted_left, cv2.COLOR_RGB2BGR), -1)).save(os.path.join(image_folder, f"{device_time}_left.png"))
+        # Image.fromarray(np.rot90(cv2.cvtColor(undistorted_right, cv2.COLOR_RGB2BGR), -1)).save(os.path.join(image_folder, f"{device_time}_right.png"))
+        # Image.fromarray(np.rot90(cv2.cvtColor(undistorted_rgb, cv2.COLOR_RGB2BGR), -1)).save(os.path.join(image_folder, f"{device_time}_rgb.png"))
 
-        # compute_depth_from_undistorted(undistorted_left, undistorted_right, left_new_calib, right_new_calib)
-        compute_depth_from_undistorted(undistorted_left, undistorted_right, left_new_calib, right_new_calib, "stereo")
+        T_rgb_camera_world = (globa_pose.transform_world_device @ pinhole_rgb.get_transform_device_camera()).inverse().to_matrix()
+        T_left_camera_world = (globa_pose.transform_world_device @ left_new_calib.get_transform_device_camera()).inverse()      .to_matrix()
+        T_right_camera_world = (globa_pose.transform_world_device @ right_new_calib.get_transform_device_camera()).inverse().to_matrix()
 
-        undistorted_left = undistorted_left[:, 80:-80]
-        left_new_calib = calibration.get_linear_camera_calibration(
-                left_new_calib.get_image_size()[1], 
-                left_new_calib.get_image_size()[1], 
-                left_new_calib.get_focal_lengths()[0],
-                "crop_left",
-                SE3.from_matrix(pinhole_rgb.get_transform_device_camera().inverse().to_matrix() @ left_new_calib.get_transform_device_camera().to_matrix()))
+        P_rgb = (T_rgb_camera_world[:3, :3] @ np.asarray(pcd.points).T + T_rgb_camera_world[:3, 3:]).T
+        u, v, depth = project_point_cloud_to_image(pcd, pinhole_rgb, T_rgb_camera_world)
+        depth = remove_farther_points_and_color(u,v, depth, pinhole_rgb.get_image_size()[0], pinhole_rgb.get_image_size()[1])   # (w, h)
+        overlay_image, depth_image = overlay_depth_on_image(undistorted_rgb, depth) # rgb
+
+        combined_result = cv2.hconcat([np.rot90(undistorted_rgb, -1), np.rot90(overlay_image, -1)])
+        Image.fromarray(cv2.cvtColor(combined_result, cv2.COLOR_RGB2BGR)).save(os.path.join(image_folder, f"{device_time}_rgb_overlay.png"))
+
+        # cv2.imshow("Overlay RGB", combined_result)
+    
+        # compute_depth_from_undistorted(undistorted_left, undistorted_right, left_new_calib, right_new_calib, "stereo")
+
+        # undistorted_left = undistorted_left[:, 80:-80]
+        # left_new_calib = calibration.get_linear_camera_calibration(
+        #         left_new_calib.get_image_size()[1], 
+        #         left_new_calib.get_image_size()[1], 
+        #         left_new_calib.get_focal_lengths()[0],
+        #         "crop_left",
+        #         SE3.from_matrix(pinhole_rgb.get_transform_device_camera().inverse().to_matrix() @ left_new_calib.get_transform_device_camera().to_matrix()))
         
-        compute_depth_from_undistorted(undistorted_rgb, undistorted_left, pinhole_rgb, left_new_calib, "left-cam")
+        # compute_depth_from_undistorted(undistorted_rgb, undistorted_left, pinhole_rgb, left_new_calib, "left-cam")
 
-        undistorted_right = undistorted_right[:, 80:-80]
-        right_new_calib = calibration.get_linear_camera_calibration(
-                right_new_calib.get_image_size()[1], 
-                right_new_calib.get_image_size()[1], 
-                right_new_calib.get_focal_lengths()[0],
-                "crop_left",
-                SE3.from_matrix(pinhole_rgb.get_transform_device_camera().inverse().to_matrix() @ right_new_calib.get_transform_device_camera().to_matrix()))
-        compute_depth_from_undistorted(undistorted_rgb, undistorted_right, pinhole_rgb, right_new_calib, "right-cam")
+        # undistorted_right = undistorted_right[:, 80:-80]
+        # right_new_calib = calibration.get_linear_camera_calibration(
+        #         right_new_calib.get_image_size()[1], 
+        #         right_new_calib.get_image_size()[1], 
+        #         right_new_calib.get_focal_lengths()[0],
+        #         "crop_left",
+        #         SE3.from_matrix(pinhole_rgb.get_transform_device_camera().inverse().to_matrix() @ right_new_calib.get_transform_device_camera().to_matrix()))
+        # compute_depth_from_undistorted(undistorted_rgb, undistorted_right, pinhole_rgb, right_new_calib, "right-cam")
         
         cv2.waitKey(0)
