@@ -309,7 +309,6 @@ if __name__ == '__main__':
     right_cam_calib = provider.get_device_calibration().get_camera_calib("camera-slam-right")
     rgb_cam_calib   = provider.get_device_calibration().get_camera_calib("camera-rgb")
 
-
     pinhole_rgb = calibration.get_linear_camera_calibration(
         512, 
         512, 
@@ -322,17 +321,17 @@ if __name__ == '__main__':
 
         l, _, r, _, rgb, _ = get_stereo_image(provider, int(device_time*1e9), TimeDomain.DEVICE_TIME)
         
-        calib_l     = calib.camera_calibs[0] # left camera calibration
-        calib_r     = calib.camera_calibs[1]  # right camera calibration
-        calib_rgb   = calib.camera_calibs[2] # rgb camera calibration
+        calib_l   = calib.camera_calibs[0]  # left camera calibration
+        calib_r   = calib.camera_calibs[1]  # right camera calibration
+        calib_rgb = calib.camera_calibs[2]  # rgb camera calibration
         
         left_new_calib  = get_updated_calib(calib_l, "left")
         right_new_calib = get_updated_calib(calib_r, "right")
         rgb_new_calib   = get_updated_calib(calib_rgb, "rgb")
 
-        left_img    = cv2.cvtColor(l.to_numpy_array(), cv2.COLOR_GRAY2RGB)
-        right_img   = cv2.cvtColor(r.to_numpy_array(), cv2.COLOR_GRAY2RGB)
-        rgb_img     = cv2.cvtColor(rgb.to_numpy_array(), cv2.COLOR_BGR2RGB)
+        left_img  = cv2.cvtColor(l.to_numpy_array(), cv2.COLOR_GRAY2RGB)
+        right_img = cv2.cvtColor(r.to_numpy_array(), cv2.COLOR_GRAY2RGB)
+        rgb_img   = cv2.cvtColor(rgb.to_numpy_array(), cv2.COLOR_BGR2RGB)
         
         undistorted_left  = undistort_image(left_img, left_new_calib, calib_l, "left")
         undistorted_right = undistort_image(right_img, right_new_calib, calib_r, "right")
@@ -355,7 +354,7 @@ if __name__ == '__main__':
         Image.fromarray(cv2.cvtColor(combined_result, cv2.COLOR_RGB2BGR)).save(os.path.join(image_folder, f"{device_time}_rgb_overlay.png"))
 
         # cv2.imshow("Overlay RGB", combined_result)
-    
+
         # compute_depth_from_undistorted(undistorted_left, undistorted_right, left_new_calib, right_new_calib, "stereo")
 
         # undistorted_left = undistorted_left[:, 80:-80]
