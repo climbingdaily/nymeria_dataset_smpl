@@ -5,6 +5,7 @@ import pickle
 from os.path import dirname, split, abspath
 from pathlib import Path
 import time 
+import gc
 
 import numpy as np
 import configargparse
@@ -183,7 +184,7 @@ def undistort_image(input_img, new_calib, input_calib, label="", is_show=False):
         cv2.imshow(f"Undistored {label}", np.rot90(undistorted_img, -1))
     return undistorted_img
 
-def load_point_cloud(points_path:str, save_pc_path:str, inv_dist_std: float=0.0006, dist_std: float=0.01, voxel_size=0.01):
+def load_point_cloud(points_path:str, save_pc_path:str, inv_dist_std: float=0.0006, dist_std: float=0.01, voxel_size=0.01, max_point_count=100000):
     raw_pts = mps.read_global_point_cloud(points_path)
     filtered_points = filter_points_from_confidence(raw_pts, inv_dist_std, dist_std)
     pts = []
@@ -192,12 +193,16 @@ def load_point_cloud(points_path:str, save_pc_path:str, inv_dist_std: float=0.00
     pts = np.stack(pts)
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts)
-    pcd = pcd.voxel_down_sample(voxel_size=voxel_size)  # remove the duplicate points
-    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2)
+    pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2)
+    pcd, _, _ = pcd.voxel_down_sample_and_trace(voxel_size, pcd.get_min_bound(), pcd.get_max_bound())  # remove the duplicate points
     o3d.io.write_point_cloud(save_pc_path, pcd)
 
     print(f"{len(pcd.points)} points after filtering.")
-    return pcd, raw_pts
+
+    points = mps.utils.filter_points_from_count(
+        raw_points=[filtered_points[i] for i in ind], max_point_count=max_point_count
+    )
+    return pcd, points
 
 def project_point_cloud_to_image(pointcloud, calib, extrnsics):
     
@@ -235,6 +240,41 @@ def remove_farther_points_and_color(us, vs, zs, image_width, image_height):
                 depth[v_int, u_int] = z
     
     return depth
+
+def process_large_observations(observations_path: str, points, online_calibs):
+    frame_indices_observations = {}
+    p_map = {}
+
+    for pp in points:
+        p_map[pp.uid] = pp.position_world.astype(np.float32)
+
+    # observations = mps.read_point_observations(observations_path)
+    import gzip
+    import csv
+
+    with gzip.open(observations_path, 'rt') as gz_file:  # Open .gz file in text mode
+        reader = csv.reader(gz_file)
+        header = next(reader)  # Read the header
+        print(f"Header: {header}")
+
+        with tqdm(desc="Processing observations", unit="row") as pbar:
+            for obs in reader:
+                point_uid = int(obs[0])  # Convert the first column to an integer
+                frame_capture_timestamp = int(obs[1])  # Convert to us timestamp
+                camera_serial = obs[2]  # Third column is the camera serial
+                uv = np.array([np.float32(obs[3]), np.float32(obs[4])])  # Last two columns are the UV coordinates as floats
+
+                if point_uid in p_map: 
+                    idx = bisection_timestamp_search(online_calibs, frame_capture_timestamp * 1e3)
+                    if idx is not None:
+                        if idx not in frame_indices_observations:
+                            frame_indices_observations[idx] = [p_map[point_uid], uv]
+                        else:
+                            frame_indices_observations[idx].append([p_map[point_uid], uv])
+                pbar.update(1)
+    
+    return frame_indices_observations
+
 
 def overlay_depth_on_image(original_image, depth, min_d = 0.8, max_d = 30):
     if original_image.shape[:2] != depth.shape[:2]:
@@ -287,10 +327,9 @@ if __name__ == '__main__':
 
     online_calibs = mps.read_online_calibration(online_calib_path)
     closed_loop_traj = mps.read_closed_loop_trajectory(closed_loop_path)
-    pcd, raw_points = load_point_cloud(glo_points_path, save_pc_path)
-    # observations = mps.read_point_observations(observations_path)
+    pcd, points = load_point_cloud(glo_points_path, save_pc_path)
     
-    # process_large_observations(observations, raw_points, closed_loop_traj, online_calibs)
+    frame_indices_observations = process_large_observations(observations_path, points, online_calibs)
 
     stream_mappings = {
         "camera-slam-left": StreamId("1201-1"),
