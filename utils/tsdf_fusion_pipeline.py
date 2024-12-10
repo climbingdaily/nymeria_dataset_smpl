@@ -117,59 +117,54 @@ class VDBFusionPipeline:
     and creates a TSDF volume
     
     Args:
-        points_dir (str): the directory where the point cloud data is stored
-        poses (list): list of poses for each point cloud
-        map_name (str): the name of the map you want to save. Defaults to tsdf
+        out_dir (str): the directory where the point cloud data is stored
         voxel_size (float): The size of the voxels in the voxel grid.
         sdf_trunc (float): The truncation distance for the TSDF.
         space_carving (str): If True, the TSDF volume will be carved out of the space. This is useful for
     scenes with large empty spaces. Defaults to False
         jump (int): how many scans to skip between each scan. Defaults to 0
-        n_scans (int): number of scans to use for the map
     """
     def __init__(self, 
-                 points_dir: str, 
-                 poses : list, 
-                 start : int=0, 
-                 end : int=np.inf, 
-                 map_name: str='tsdf', 
+                 out_dir: str, 
                  voxel_size: float=0.1, 
                  sdf_trunc: float=0.1, 
-                 space_carving: str=False, 
-                 jump: int = 0, 
-                 n_scans: int = -1):
+                 space_carving: str=False):
         
         # load pcd data
-        points_list = os.listdir(points_dir)
-        points_list = glob(points_dir+'/*.pcd')
         
-        def get_file_time(x):
-            return float(os.path.split(x)[1].split('.')[0].replace('_', '.'))
-        
-        points_list = sorted(points_list, key=lambda x: get_file_time(x))[start: end]
-        
-        assert len(points_list) == len(poses)
-        
-        self._dataset = [[pt, rt] for pt, rt in zip(points_list, poses)]
         self.voxel_size = voxel_size
         self.sdf_trunc = sdf_trunc
         self.space_carving = space_carving
         
-        self._n_scans = len(self._dataset) if n_scans == -1 else n_scans
-        self._jump = jump
         
-        self.out_dir = os.path.dirname(points_dir)
-        self._map_name = f"{map_name}_{self._n_scans}frames"
+        self.out_dir = out_dir
         
-        self._tsdf_volume = VDBVolume(
+        self.vdbvolume = VDBVolume(
             self.voxel_size,
             self.sdf_trunc,
             self.space_carving,
         )
-        self._res = {}
+        self.mesh = None
+        self.times = []
+    
+    @property
+    def _map_name(self):
+        return f"tsdf_{self._n_scans}frames"
 
-    def run(self, skip:int=10, save_vdb:bool=False):
-        self._run_tsdf_pipeline(skip=skip)
+    @property
+    def _res(self):
+        if self.mesh is None:
+            self.mesh  = self._get_o3d_mesh(self.vdbvolume)
+        return {"mesh": self.mesh, "times": self.times}
+
+    def append_time(self, time):
+        self.times.append(time)
+
+    @property
+    def _n_scans(self):
+        return len(self.times)
+
+    def save_to_disk(self, save_vdb:bool=False):
         self._write_ply()
         # self._write_cfg()
         if save_vdb:
@@ -192,32 +187,12 @@ class VDBFusionPipeline:
         pass
 
     def __len__(self):
-        return len(self._dataset)
-
-    def _run_tsdf_pipeline(self, skip=10):
-        times = []
-        for idx in trange(self._jump, self._jump + self._n_scans, skip, unit=" frames", desc='TSDF Fusion'):
-            scan, pose = self._dataset[idx]
-            tic = time.perf_counter_ns()
-            
-            if pose.shape[0] == 12:
-                pose = pose.reshape(3, 4)
-                pose = np.vstack([pose, np.array([0,0,0,1])])
-            try:
-                pt = load_point_cloud(os.path.join(os.path.dirname(scan) + '_cropped', os.path.basename(scan)), position=pose[:3, 3])
-                
-            except Exception as e:
-                pt = load_point_cloud(scan, position=pose[:3, 3])
-            self._tsdf_volume.integrate(np.array(pt.points), pose)
-            
-            toc = time.perf_counter_ns()
-            times.append(toc - tic)
-        self._res = {"mesh": self._get_o3d_mesh(self._tsdf_volume), "times": times}
+        return self._n_scans
 
     def _write_vdb(self):
         os.makedirs(self.out_dir, exist_ok=True)
         filename = os.path.join(self.out_dir, self._map_name) + ".vdb"
-        self._tsdf_volume.extract_vdb_grids(filename)
+        self.vdbvolume.extract_vdb_grids(filename)
 
     def _write_ply(self):
         os.makedirs(self.out_dir, exist_ok=True)
@@ -232,7 +207,7 @@ class VDBFusionPipeline:
     def _print_tim(self):
         total_time_ns = reduce(lambda a, b: a + b, self._res["times"])
         total_time = total_time_ns * 1e-9
-        total_scans = self._n_scans - self._jump
+        total_scans = self._n_scans
         self.fps = float(total_scans / total_time)
 
     @staticmethod
@@ -268,10 +243,10 @@ class VDBFusionPipeline:
         print(f"Avg FPS          = {self.fps:.2f} [Hz]")
         # print(f"--------------------------------------------------")
                 # If PYOPENVDB_SUPPORT has not been enabled then we can't report any metrics
-        if self._tsdf_volume.pyopenvdb_support_enabled:
+        if self.vdbvolume.pyopenvdb_support_enabled:
             # print("No metrics available, please compile with PYOPENVDB_SUPPORT")
             # Compute the dimensions of the volume mapped
-            grid = self._tsdf_volume.tsdf
+            grid = self.vdbvolume.tsdf
             bbox = grid.evalActiveVoxelBoundingBox()
             dim = np.abs(np.asarray(bbox[1]) - np.asarray(bbox[0]))
             volume_extent = np.ceil(self.voxel_size * dim).astype(np.int32)
@@ -298,3 +273,5 @@ class VDBFusionPipeline:
 
         # Print it
         # os.system(f"cat {filename}")
+
+        self.mesh = None
