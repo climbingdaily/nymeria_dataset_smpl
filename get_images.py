@@ -281,57 +281,6 @@ def remove_farther_points_and_color(us, vs, zs, image_width, image_height):
     
     return depth
 
-def process_large_observations(observations_path: str, points, online_calibs):
-    observations_by_frame = {}
-    file_path = os.path.join(os.path.dirname(observations_path), "observations_by_frame.pkl.gz")
-    if os.path.exists(file_path):
-        try:
-            with gzip.open(file_path, 'rb') as gz_file:
-                observations_by_frame = pickle.load(gz_file)
-            print(f"Observations loaded from {file_path}")
-            return observations_by_frame
-        except Exception as e:
-                print(f"Error loading observations from {file_path}: {str(e)}")
-                
-    p_map = {}
-
-    for pp in points: 
-        p_map[pp.uid] = pp.position_world.astype(np.float32)
-
-    # observations = mps.read_point_observations(observations_path)
-
-    with gzip.open(observations_path, 'rt') as gz_file:  # Open .gz file in text mode
-        reader = csv.reader(gz_file)
-        header = next(reader)  # Read the header
-        print(f"Header: {header}")
-
-        with tqdm(desc="Processing observations", unit="row") as pbar:
-            for i, obs in enumerate(reader):
-                point_uid = int(obs[0])  # Convert the first column to an integer
-                frame_capture_timestamp = int(obs[1])  # Convert to us timestamp
-                camera_serial = obs[2]  # Third column is the camera serial
-                uv = np.array([np.float32(obs[3]), np.float32(obs[4])])  # Last two columns are the UV coordinates as floats
-
-                if point_uid in p_map: 
-                    idx = bisection_timestamp_search(online_calibs, frame_capture_timestamp * 1e3)
-                    if idx is not None:
-                        ts = online_calibs[idx].tracking_timestamp.total_seconds() * 1e9
-                        if idx not in observations_by_frame:
-                            observations_by_frame[idx] = [[p_map[point_uid], uv, ts]]
-                        else:
-                            observations_by_frame[idx].append([p_map[point_uid], uv, ts])
-               
-                if i % 10000 == 0:  # Update tqdm every 1000 rows
-                    pbar.update(10000)
-    
-    if len(observations_by_frame) > 0:
-        with gzip.open(file_path, 'wb') as gz_file:
-            pickle.dump(observations_by_frame, gz_file)
-        print(f"Observations saved in {file_path}")
-
-    return observations_by_frame
-
-
 def overlay_depth_on_image(original_image, depth, min_d = 0.8, max_d = 30):
     if original_image.shape[:2] != depth.shape[:2]:
         raise ValueError("Original image and color image must have the same dimensions")
@@ -523,8 +472,6 @@ def main(args):
     # load data
     online_calibs    = mps.read_online_calibration(online_calib_path)
     closed_loop_traj = mps.read_closed_loop_trajectory(closed_loop_path)
-    _, points      = load_point_cloud(glo_points_path, save_pc_path)
-    observations_by_frame = process_large_observations(observations_path, points, online_calibs)
 
     provider: VrsDataProvider = data_provider.create_vrs_data_provider(vrsfile)
     # left_config = provider.get_image_configuration(StreamId("1201-1"))
@@ -535,31 +482,33 @@ def main(args):
     rgb_cam_calib   = provider.get_device_calibration().get_camera_calib("camera-rgb")
 
     new_calib = calibration.get_linear_camera_calibration(
-        512, 
-        512, 
-        256, "camera-rgb",rgb_cam_calib.get_transform_device_camera())
+        1024, 
+        1024, 
+        512, "camera-rgb",rgb_cam_calib.get_transform_device_camera())
     
     vdbf = VDBFusionPipeline(out_dir       = head_f,
                              sdf_trunc     = args.sdf_trunc,
                              voxel_size    = args.voxel_size, 
                              space_carving = True)
 
-    skip_start = 240*20
+    skip_start = 240*5
     skip_end = 240*20
     counts = skip_start - 1
     valid_scan = 0
-    depth_model = get_depth_model()
 
     extrinsics_sequence = []
     timestamps_sequence = []
     depth_sequence = []
     rgb_sequence = []
 
+    # fourcc = cv2.VideoWriter_fourcc(*'mp4v')  
+    fourcc = cv2.VideoWriter_fourcc(*'FFV1')
+    fps = 30  
+    w, h  = new_calib.get_image_size()
+    video_writer = cv2.VideoWriter(os.path.join(head_f, "video.avi"), fourcc, fps, (w, h))
+
     for calib in tqdm(online_calibs[skip_start: -skip_end], desc="Processing"):
         counts += 1
-        if counts not in observations_by_frame:
-            print(f"No observations by frame {counts}")
-            continue
         device_time = calib.tracking_timestamp.total_seconds()
         calib_l, calib_r, calib_rgb = calib.camera_calibs # calibration results
         globa_pose  = get_nearest_pose(closed_loop_traj, int(device_time*1e9))
@@ -579,19 +528,21 @@ def main(args):
         # new_calib   = get_updated_calib(calib_rgb, "rgb")
         rgb_img   = cv2.cvtColor(rgb.to_numpy_array(), cv2.COLOR_BGR2RGB)
         undistorted_img   = undistort_image(rgb_img, new_calib, rgb_cam_calib, "rgb")
-        T_cam_world   = (globa_pose.transform_world_device @ new_calib.get_transform_device_camera()).inverse().to_matrix()
+        # cv2.imwrite(os.path.join(image_folder, f"{device_time:.6f}.png"), np.rot90(undistorted_img, -1))
+        video_writer.write(np.rot90(undistorted_img, -1))
+        # T_cam_world   = (globa_pose.transform_world_device @ new_calib.get_transform_device_camera()).inverse().to_matrix()
 
-        points = np.stack([obs[0] for obs in observations_by_frame[counts]])
-        u, v, depth = project_point_cloud_to_image(points, new_calib, T_cam_world)
-        depth_by_projection = remove_farther_points_and_color(u,v, depth, 
-                                                            new_calib.get_image_size()[0], 
-                                                            new_calib.get_image_size()[1])   # (w, h)
-        depth = depth_model.infer_image(np.rot90(undistorted_img, -1), 518)
-        depth = np.rot90(depth, 1)
-        d_correct = get_depth_scale(depth_by_projection, depth)
+        # points = np.stack([obs[0] for obs in observations_by_frame[counts]])
+        # u, v, depth = project_point_cloud_to_image(points, new_calib, T_cam_world)
+        # depth_by_projection = remove_farther_points_and_color(u,v, depth, 
+                                                            # new_calib.get_image_size()[0], 
+                                                            # new_calib.get_image_size()[1])   # (w, h)
+        # depth = depth_model.infer_image(np.rot90(undistorted_img, -1), 518)
+        # depth = np.rot90(depth, 1)
+        # d_correct = get_depth_scale(depth_by_projection, depth)
 
-        if d_correct is None or np.any(d_correct < 0):
-            continue
+        # if d_correct is None or np.any(d_correct < 0):
+            # continue
         
         
         # save all images
@@ -603,60 +554,8 @@ def main(args):
         
         # cv2.imwrite(os.path.join(image_folder, f"{device_time:.6f}.png"), combined_result)
 
-        valid_scan += 1
-        scan = depth_point_cloud(d_correct, 
-                        undistorted_img, 
-                        new_calib, np.linalg.inv(T_cam_world),
-                        image_folder, f"{device_time:.6f}.pcd")
-        
-        extrinsics_sequence.append(np.linalg.inv(T_cam_world))
-        depth_sequence.append(d_correct)
-        rgb_sequence.append(undistorted_img)
-        timestamps_sequence.append(device_time*1e6)
-
-        if valid_scan % 3 == 0 and is_tsdf:
-            tic = time.perf_counter_ns()
-            vdbf.vdbvolume.integrate(np.asanyarray(scan.points), np.linalg.inv(T_cam_world))
-            vdbf.append_time(time.perf_counter_ns() - tic)
-
-        if valid_scan % 6000 == 0 and is_tsdf:
-            print(f"Saved {valid_scan} scans")
-            vdbf.save_to_disk()
-
-
         # cv2.imshow("Overlay RGB", combined_result)
-
-        """
-        compute_depth_from_undistorted(undistorted_img, undistorted_img, left_new_calib, right_new_calib, "stereo")
-
-        undistorted_img = undistorted_img[:, 80:-80]
-        left_new_calib = calibration.get_linear_camera_calibration(
-                left_new_calib.get_image_size()[1], 
-                left_new_calib.get_image_size()[1], 
-                left_new_calib.get_focal_lengths()[0],
-                "crop_left",
-                SE3.from_matrix(pinhole_rgb.get_transform_device_camera().inverse().to_matrix() @ left_new_calib.get_transform_device_camera().to_matrix()))
-        
-        compute_depth_from_undistorted(undistorted_img, undistorted_img, pinhole_rgb, left_new_calib, "left-cam")
-
-        undistorted_img = undistorted_img[:, 80:-80]
-        right_new_calib = calibration.get_linear_camera_calibration(
-                right_new_calib.get_image_size()[1], 
-                right_new_calib.get_image_size()[1], 
-                right_new_calib.get_focal_lengths()[0],
-                "crop_left",
-                SE3.from_matrix(pinhole_rgb.get_transform_device_camera().inverse().to_matrix() @ right_new_calib.get_transform_device_camera().to_matrix()))
-        compute_depth_from_undistorted(undistorted_img, undistorted_img, pinhole_rgb, right_new_calib, "right-cam")
-        
-        cv2.waitKey(0)
-        """
-
-    with h5py.File('depth_sequence_parallel.h5', 'w') as f:
-        f.create_dataset('intrinsics', data=np.array([*new_calib.get_focal_lengths(), *new_calib.get_principal_point()]) )
-        f.create_dataset('depth_sequence', data=np.stack(depth_sequence), dtype=np.float32)
-        f.create_dataset('rgb_sequence', data=np.stack(rgb_sequence), dtype=np.float32)
-        f.create_dataset('extrinsics', data=np.stack(extrinsics_sequence), dtype=np.float32)
-        f.create_dataset('timestamps', data=np.stack(timestamps_sequence), dtype=np.int64)
+    video_writer.release()
 
 if __name__ == '__main__':
     parser = configargparse.ArgumentParser()
