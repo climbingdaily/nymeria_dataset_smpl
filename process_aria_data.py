@@ -7,16 +7,26 @@ from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+import cv2
+from tqdm import tqdm
+from loguru import logger
 
 import configargparse
 from projectaria_tools.core.sophus import SE3
-
+from projectaria_tools.core import calibration
+from projectaria_tools.core.sensor_data import (
+    ImageData,
+    ImageDataRecord,
+    TimeDomain,
+    TimeQueryOptions,
+)
 sys.path.append(dirname(split(abspath( __file__))[0]))
 
 from nymeria.data_provider import NymeriaDataProvider
 from nymeria.handeye import HandEyeSolver
 from utils import poses_to_joints, mocap_to_smpl_axis, sync_lidar_mocap, poses_to_vertices_torch
-from utils import save_json_file, read_json_file, load_csv_data, print_table, compute_similarity
+from utils import save_json_file, read_json_file, print_table, compute_similarity
+from utils.cam_tool import *
 
 field_fmts = ['%d', '%.6f', '%.6f', '%.6f', '%.6f', '%.6f', '%.6f', '%.6f', '%.3f']
 
@@ -37,7 +47,7 @@ def save_trajs(save_dir, rot, pos, mocap_id, comments='first', framerate=100):
 
     return t
 
-def finetune_first_person_data(synced_data_file, sensor_traj):
+def finetune_first_person_data(synced_data_file, sensor_traj, T_sensor_head, return_verts=False):
     """
     > It takes the head sensor trajectory and the parameter file, 
       and then it saves the LiDAR trajectory in the parameter file
@@ -53,19 +63,16 @@ def finetune_first_person_data(synced_data_file, sensor_traj):
 
         fp_data['lidar_traj'] = sensor_traj
 
-        try:
-            _, j, glo_rot = poses_to_vertices_torch(first_pose, mocap_tran)
-        except:
-            _, j, glo_rot = poses_to_vertices_torch(first_pose, mocap_tran, is_cuda=False)
+        _, j, glo_rot = poses_to_vertices_torch(first_pose, mocap_tran, is_cuda=False)
 
         # save smpl head trajectory
-        smpl_head_traj = np.concatenate((save_data['frame_num'].reshape(-1, 1), 
-                                            j[:, 15]), axis=1)
+        smpl_head_traj = np.concatenate((save_data['frame_num'].reshape(-1, 1), j[:, 15].cpu().numpy()), axis=1)
         smpl_head_traj_path = os.path.join(os.path.dirname(synced_data_file), 'smpl_head_trajectory.txt')
         np.savetxt(smpl_head_traj_path, smpl_head_traj)
         print(f'Saved initial smpl head trajectory to {smpl_head_traj_path}')
         
-        head_to_root = (j[:, 0] - j[:, 15]).cpu().numpy()
+        head_to_root = (j[:, 0] - j[:, 15]).cpu().numpy() # head joint to root joint
+        root_to_trans = mocap_tran - j[:, 0].cpu().numpy() # root joint to smpl translation 
 
         ROT, _, _ = compute_similarity(j[:len(mocap_tran)//2, 15, :2].numpy(), 
                                        sensor_traj[:len(mocap_tran)//2, 1:3])
@@ -73,58 +80,21 @@ def finetune_first_person_data(synced_data_file, sensor_traj):
         delta_degree = np.linalg.norm(R.from_matrix(ROT).as_rotvec()) * 180 / np.pi
         print(f'[First person] {delta_degree:.1f}° around Z-axis from the mocap to LiDAR data.')
 
-        scaled_trans = mocap_tran @ ROT.T
-        scaled_trans = (scaled_trans - scaled_trans[0]) + (sensor_traj[0, 1:4] + head_to_root[0]) # move to the sensor start position
-
-        first_pose[:, :3] = (R.from_matrix(ROT) * R.from_rotvec(first_pose[:, :3])).as_rotvec()
-
-        fp_data['mocap_trans'] = scaled_trans
-        fp_data['mocap_pose'] = first_pose.copy()
-
-        # joints, verts = poses_to_joints(first_pose[:1], return_verts=True, is_cuda=False) 
-        # feet_center = (joints[0, 7] + joints[0, 8])/2
-        # feet_center[2] = verts[..., 2].min()
-        # scaled_trans -= scaled_trans[0] + feet_center  # 
-
-        # solve handeye (eye in the hand)
-        handeye = HandEyeSolver(
-            stride=2,
-            smooth=False,
-            skip=30 * 5,
-            window=30 * 120,
-        )
-        
         aria_se3 = SE3.from_quat_and_translation(
             sensor_traj[:, 7], 
             sensor_traj[:, 4:7], 
             sensor_traj[:, 1:4]
         )
-        
-        smpl_head_se3 = SE3.from_quat_and_translation(
-            R.from_matrix(ROT @ glo_rot[:, 15].numpy()).as_quat()[:, 3], 
-            R.from_matrix(ROT @ glo_rot[:, 15].numpy()).as_quat()[:, :3], 
-            scaled_trans
-        )
 
-        Ts_Hd_Hx: list[SE3] = handeye(
-            T_Wa_A=aria_se3,
-            T_Wb_B=smpl_head_se3,
-        )
-        print(f"from xsense (smpl head) to aria head:\n {Ts_Hd_Hx[0].to_matrix()}")
+        New_translation = (aria_se3.to_matrix() @ T_sensor_head)[:, :3, 3] + head_to_root @ ROT.T + root_to_trans
 
-        head_to_aria = Ts_Hd_Hx[0].to_matrix()  # 4*4
+        first_pose[:, :3] = (R.from_matrix(ROT) * R.from_rotvec(first_pose[:, :3])).as_rotvec()
 
-
-        # head_world_rot = R.from_matrix(ROT @ glo_rot[:, 15].numpy())
-        # root_world_rot = R.from_matrix(ROT @ glo_rot[:, 0].numpy())
-        # new_root_rot = R.from_matrix(new_head_trans[:, :3, :3]) * head_world_rot.inv() * root_world_rot 
-        # first_pose[:, :3] = new_root_rot.as_rotvec()
-        new_head_trans = aria_se3.to_matrix() @ head_to_aria
-        fp_data['trans'] = new_head_trans[:, :3, 3] + head_to_root
+        fp_data['trans'] = New_translation
         fp_data['pose'] = first_pose
-        fp_data['mocap_trans'] = (scaled_trans - scaled_trans[0]) + (new_head_trans[0, :3, 3] + head_to_root[0])
-
-        fp_data['head_to_aria'] = head_to_aria.tolist()
+        fp_data['mocap_pose'] = first_pose.copy()
+        fp_data['mocap_trans'] = (mocap_tran - mocap_tran[0]) @ ROT.T + New_translation[0]
+        fp_data['T_sensor_head'] = T_sensor_head.tolist()
 
     else:
         save_data['first_person'] = {'lidar_traj': sensor_traj}
@@ -132,6 +102,8 @@ def finetune_first_person_data(synced_data_file, sensor_traj):
     with open(synced_data_file, "wb") as f:
         pickle.dump(save_data, f)
         print(f"File saved in {synced_data_file}")
+
+    return fp_data['pose'], fp_data['trans'], fp_data['mocap_trans']
 
 def make_sensor_params(sensor, gap_frame):
     info = f"{sensor['syncid'][gap_frame]} ({sensor['times'][sensor['syncid'][gap_frame]]}s) " if gap_frame>0 else gap_frame
@@ -194,13 +166,6 @@ def save_sync_data(root_folder, head_traj, body_data, start=0, end=np.inf, gap_f
     except:
         save_data = {}
 
-    def load_csv(search_str='*'):
-        rot_csv = glob(root_folder + f'/mocap_data/*{search_str}_rot*.csv')[0]
-        pos_csv = glob(root_folder + f'/mocap_data/*{search_str}_*pos.csv')[0]
-        pos, rot, col = load_csv_data(rot_csv, pos_csv)
-        mocap['times'] = rot[:, 0]
-        return pos, rot, col
-    
     try:
         imu_start, imu_end = body_data['index_span']
         first_pos = body_data['segment_tXYZ'].reshape(-1, 23, 3)[imu_start:imu_end]
@@ -218,30 +183,16 @@ def save_sync_data(root_folder, head_traj, body_data, start=0, end=np.inf, gap_f
         print('=======================')
         first_data = False
         
-    try:
-        second_pos, second_rot, col_names = load_csv('second')
-    except:
-        try:
-            second_pos, second_rot, col_names = load_csv('*')
-        except:
-            print('=======================')
-            print('No second person data!!')
-            print('=======================')
-            second_data = False
+    print('=======================')
+    print('No second person data!!')
+    print('=======================')
+    second_data = False
 
     if not first_data and not second_data:
         print("No mocap data in './mocap_data/'!!!")
         exit(0)
-    
 
-    def get_keyid(sensor: dict):
-        keyid = []
-        for kt in sensor['keytime']:
-            keyid.append(np.where(abs(sensor['times'] - kt) < 0.85/sensor['framerate'])[0][-1])
-        return keyid
-    
     if True:
-    
         sensor['syncid'], mocap['syncid'] = sync_lidar_mocap(sensor['times'], mocap['times'], 0.5/mocap['framerate'])
         if 'start' in dataset_params:
             start =  dataset_params['start']
@@ -293,34 +244,35 @@ def save_sync_data(root_folder, head_traj, body_data, start=0, end=np.inf, gap_f
         # 3. save synced data
         update_data(save_data, 'first', trans, sync_pose)
 
-    if second_data:
-        fix_orit = True if not first_data else False
-
-        sync_pose_2nd, delta_r = mocap_to_smpl_axis(second_rot[mocap['syncid']], 
-                                           fix_orit=fix_orit,
-                                           col_name=col_names)
-
-        second_trans = save_trajs(save_dir, sync_pose_2nd, 
-                                  second_pos[mocap['syncid']] @ delta_r.T, 
-                                  mocap['syncid'], 'second', mocap['framerate'])
-        update_data(save_data, 'second', second_trans, sync_pose_2nd)
-        if not first_data:
-            trans = second_trans
-            sync_pose = sync_pose_2nd
-
     save_data['framerate'] = sensor['framerate']
+    save_data['device_ts'] = sensor['times'][sensor['syncid']]
 
     with open(param_file, "wb") as f:
         pickle.dump(save_data, f)
         print(f"File saved in {param_file}")
     
-    return sync_pose, trans, sensor['syncid'], param_file   # type: ignore
+    return save_data['device_ts'], sensor['syncid'], param_file   # type: ignore
+
+
+def project_pts_img(img, points, linear_calib, T_world_device, size=3):
+    T_cam_world   = (T_world_device @ linear_calib.get_transform_device_camera()).inverse().to_matrix()
+    u, v, depth = project_point_cloud_to_image(points, linear_calib, T_cam_world)
+    depth_by_projection = remove_further_points_and_color(u,v, depth, 
+                                                        linear_calib.get_image_size()[0], 
+                                                        linear_calib.get_image_size()[1])   # (w, h)
+    if depth_by_projection.max() > 0.1:
+        return overlay_depth_on_image(img, 
+                                    depth_by_projection, 
+                                    min_d=0.2,
+                                    size=size)[0] # rgb
+    else:
+        return img.copy()
 
 if __name__ == '__main__':
     parser = configargparse.ArgumentParser()
 
     parser.add_argument("--root_folder", type=str, 
-                        default="D:\\Data\\20231222_s1_kenneth_fischer_act7_56uvqd",
+                        default="/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd",
                         help="The data's root directory")
 
     parser.add_argument("--traj_file", type=str, default='lidar_trajectory.txt')
@@ -348,16 +300,11 @@ if __name__ == '__main__':
     parser.add_argument('--sync', action='store_true', 
                         help='Synced all data and save a pkl based on the params_file')
 
-    args, opts    = parser.parse_known_args()
-    root_folder   = args.root_folder
-
-    head_f        = glob(root_folder + '/*head')[0]
-    traj_file     = os.path.join(head_f, 'mps', 'slam', 'closed_loop_trajectory.csv')
-
-    params_file   = os.path.join(root_folder, args.params_file)
-
-    lidar_dir     = os.path.join(root_folder, 'lidar_data', 'lidar_frames_rot')
-
+    args, opts  = parser.parse_known_args()
+    root_folder = args.root_folder
+    head_f      = glob(root_folder + '/*head')[0]
+    traj_file   = os.path.join(head_f, 'mps', 'slam', 'closed_loop_trajectory.csv')
+    params_file = os.path.join(root_folder, args.params_file)
     if os.path.exists(params_file):
         dataset_params = read_json_file(params_file)
         if 'start' in dataset_params:
@@ -387,16 +334,31 @@ if __name__ == '__main__':
         print(f'{len(aria_trajs[traj_name])}')
 
     aria_points = nd_lodaer.get_all_pointclouds()
-    head_traj = aria_trajs['recording_head']
-    head_pc = aria_points['recording_head']
     for tag, pc in aria_points.items():
         save_path = os.path.join(root_folder, 'body', f'pc_{tag}.txt')
         np.savetxt(save_path, pc)
+
+    # get head_traj based on the online_calibs times
+    head_traj = []
+    global_poses = []
+    for idx, t_s in enumerate(aria_trajs['recording_head'][:, -1]):
+        calib = nd_lodaer.recording_head.mps_dp.get_online_calibration(int(t_s*1e9))
+        ct = calib.tracking_timestamp.total_seconds()
+        pose, _ = nd_lodaer.recording_head.get_pose(int(ct*1e9), TimeDomain.DEVICE_TIME)
+        q_xyzw = R.from_matrix(pose.transform_world_device.to_matrix()[:3, :3]).as_quat()
+        xyz = pose.transform_world_device.to_matrix()[:3, 3]
+        head_traj.append(np.hstack([idx, q_xyzw, xyz, ct]))
+        global_poses.append(pose)
+
+    head_traj = np.array(head_traj)
+
+    head_traj = aria_trajs['recording_head']
+    head_pc = aria_points['recording_head']
         
     # aria_poses = nd_lodaer.get_synced_poses()
     save_path = os.path.join(os.path.dirname(traj_file), 'head_trajectory.txt')
     np.savetxt(save_path, head_traj)
-    print(f"Aria glassed Head trajectory saved in {save_path}")
+    print(f"Aria glasses Head trajectory saved in {save_path}")
 
     start = np.searchsorted(nd_lodaer.body_dp.xsens_data['timestamps_us'], nd_lodaer.timespan_ns[0]/1e3) + 240
     end = np.searchsorted(nd_lodaer.body_dp.xsens_data['timestamps_us'], nd_lodaer.timespan_ns[1]/1e3) - 240
@@ -410,11 +372,74 @@ if __name__ == '__main__':
     # --------------------------------------------
     # 2. Synchronize the Aria and mocap data.
     # --------------------------------------------
-    _, _, frameids, synced_data_file = save_sync_data(
+    device_time, frameids, synced_data_file = save_sync_data(
         root_folder, 
         head_traj,
         nd_lodaer.body_dp.xsens_data,
         start = args.start_idx, 
         end   = args.end_idx)
     
-    finetune_first_person_data(synced_data_file, head_traj[frameids])
+    # define T_head_aria
+    T_head_aria = nd_lodaer.recording_head.vrs_dp.get_device_calibration().get_transform_device_cpf().to_matrix().T
+    T_head_aria[:3, 3] = np.array([0.067, 0.091, 0.085])
+    T_sensor_head = np.linalg.inv(T_head_aria)  # transformation from head to aria
+    print(f"Transformation from head to aria: \n{T_sensor_head}")
+
+    first_pose, first_tran, trans2 = finetune_first_person_data(synced_data_file, head_traj[frameids], T_sensor_head)
+
+    # --------------------------------------------
+    # 4. Synchronize the camera data
+    # --------------------------------------------
+    vis_cam = True
+    if vis_cam:
+        calib_head   = nd_lodaer.recording_head.vrs_dp.get_device_calibration().get_camera_calib("camera-rgb")
+        new_calib_head = calibration.get_linear_camera_calibration(
+            512, 
+            512, 
+            200, "camera-rgb",calib_head.get_transform_device_camera())
+        
+        calib_obs   = nd_lodaer.recording_observer.vrs_dp.get_device_calibration().get_camera_calib("camera-rgb")
+        new_calib_obs = calibration.get_linear_camera_calibration(
+            512, 
+            512, 
+            200, "camera-rgb",calib_obs.get_transform_device_camera())
+
+        fourcc = cv2.VideoWriter_fourcc(*'FFV1')
+        # fourcc = cv2.VideoWriter_fourcc(*'X264')
+        fps = 30  
+        w, h  = new_calib_obs.get_image_size()
+        video_writer = cv2.VideoWriter(os.path.join(head_f, "video.avi"), fourcc, fps, (w*2, h*2))
+        
+        vertices, j, _ = poses_to_vertices_torch(first_pose, first_tran, is_cuda=True)
+        vertices2, j, _ = poses_to_vertices_torch(first_pose, trans2, is_cuda=True)
+        for idx, t_s in tqdm(enumerate(device_time), total=len(device_time), desc="Processing"):
+            result = nd_lodaer.recording_head.get_rgb_image(int(t_s*1e9), TimeDomain.DEVICE_TIME)
+            if abs(result[-1] / 1e6) > 33:  # 33ms
+                logger.warning(f"time difference for image query: {result[-1]/ 1e6} ms")
+            rgb_img = cv2.cvtColor(result[0].to_numpy_array(), cv2.COLOR_BGR2RGB)
+            undistorted_img  = undistort_image(rgb_img, new_calib_head, calib_head, "rgb")
+            img = project_pts_img(undistorted_img, vertices[idx].cpu().numpy(), new_calib_head, global_poses[frameids[idx]].transform_world_device)
+            img2 = project_pts_img(undistorted_img, vertices2[idx].cpu().numpy(), new_calib_head, global_poses[frameids[idx]].transform_world_device, size=5)
+
+            tc = nd_lodaer.recording_head.vrs_dp.convert_from_device_time_to_timecode_ns(int(t_s*1e9))
+
+            pose, _ = nd_lodaer.recording_observer.get_pose(tc, TimeDomain.TIME_CODE)
+            result = nd_lodaer.recording_observer.get_rgb_image(tc, TimeDomain.TIME_CODE)
+            if abs(result[-1] / 1e6) > 33:  # 33ms
+                logger.warning(f"time difference for image query: {result[-1]/ 1e6} ms")
+            rgb_img = cv2.cvtColor(result[0].to_numpy_array(), cv2.COLOR_BGR2RGB)
+            undistorted_img  = undistort_image(rgb_img, new_calib_obs, calib_obs, "rgb")
+            img3 = project_pts_img(undistorted_img, vertices[idx].cpu().numpy(), new_calib_obs, pose.transform_world_device, size=1)
+            img4 = project_pts_img(undistorted_img, vertices2[idx].cpu().numpy(), new_calib_obs, pose.transform_world_device, size=1)
+
+            img_a = cv2.hconcat([np.rot90(img, -1), 
+                               np.rot90(img2, -1)])
+            img_b = cv2.hconcat([np.rot90(img3, -1), 
+                               np.rot90(img4, -1)])
+            
+            final_image = cv2.vconcat([img_a, img_b])
+            # cv2.imshow("Overlay RGB", final_image) 
+            # cv2.waitKey(1)
+            video_writer.write(final_image)
+        video_writer.release()
+

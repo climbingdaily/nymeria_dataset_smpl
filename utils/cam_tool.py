@@ -1,15 +1,7 @@
-import sys
 import os
-from glob import glob
 import pickle
-from os.path import dirname, split, abspath
-from pathlib import Path
-import time 
-import gc
 
 import numpy as np
-import configargparse
-from PIL import Image
 import cv2
 import open3d as o3d
 import matplotlib
@@ -21,10 +13,9 @@ import matplotlib.pyplot as plt
 import h5py
 
 import projectaria_tools.core.mps as mps
-from projectaria_tools.core.sophus import SE3
-from projectaria_tools.core import data_provider, calibration
+from projectaria_tools.core import calibration
 from projectaria_tools.core.data_provider import VrsDataProvider
-from projectaria_tools.core.mps.utils import get_nearest_pose, filter_points_from_confidence, bisection_timestamp_search
+from projectaria_tools.core.mps.utils import filter_points_from_confidence, bisection_timestamp_search
 from projectaria_tools.core.stream_id import StreamId
 from projectaria_tools.core.sensor_data import (
     ImageData,
@@ -32,7 +23,13 @@ from projectaria_tools.core.sensor_data import (
     TimeDomain,
     TimeQueryOptions,
 )
-from utils.tsdf_fusion_pipeline import VDBFusionPipeline
+
+__all__ = ['project_point_cloud_to_image', 
+           'remove_further_points_and_color', 
+           'overlay_depth_on_image',
+           'color_depth',
+           'undistort_image']
+
 
 def color_depth(depth, normalize=True, is_rot=False, max_depth=10):
     if normalize:
@@ -332,7 +329,7 @@ def process_large_observations(observations_path: str, points, online_calibs):
     return observations_by_frame
 
 
-def overlay_depth_on_image(original_image, depth, min_d = 0.8, max_d = 30):
+def overlay_depth_on_image(original_image, depth, min_d = 0.8, max_d = 30, size=3):
     if original_image.shape[:2] != depth.shape[:2]:
         raise ValueError("Original image and color image must have the same dimensions")
     
@@ -346,7 +343,7 @@ def overlay_depth_on_image(original_image, depth, min_d = 0.8, max_d = 30):
     for y in range(depth.shape[0]):
         for x in range(depth.shape[1]):
             if mask[y, x]:
-                cv2.circle(overlay_image, (x, y), 3, depth_image[y, x].tolist(), thickness=-1)
+                cv2.circle(overlay_image, (x, y), size, depth_image[y, x].tolist(), thickness=-1)
 
     depth_image[~mask] = 0
 
@@ -501,182 +498,3 @@ def get_depth_scale(depth_by_projection, depth_estimated, is_show=False):
             print(f"scale is negative: {scale}")
 
     return depth_corrected
-
-def main(args):
-    root_folder   = args.root_folder
-
-    head_f        = glob(root_folder + '/*head')[0]
-    image_folder      = os.path.join(head_f, "images")
-    if not os.path.exists(image_folder):
-        os.makedirs(image_folder)
-
-    is_tsdf = args.tsdf
-
-    hdf5_filename     = os.path.join(head_f, 'rgbd.h5')
-    online_calib_path = os.path.join(head_f, 'mps', 'slam', 'online_calibration.jsonl')
-    closed_loop_path  = os.path.join(head_f, 'mps', 'slam', 'closed_loop_trajectory.csv')
-    glo_points_path   = os.path.join(head_f, 'mps', 'slam', 'semidense_points.csv.gz')
-    observations_path = os.path.join(head_f, 'mps', 'slam', 'semidense_observations.csv.gz')
-    vrsfile           = os.path.join(head_f, 'data', 'data.vrs')
-    save_pc_path      = os.path.join(head_f, 'points_head.pcd')
-
-    # load data
-    online_calibs    = mps.read_online_calibration(online_calib_path)
-    closed_loop_traj = mps.read_closed_loop_trajectory(closed_loop_path)
-    _, points      = load_point_cloud(glo_points_path, save_pc_path)
-    observations_by_frame = process_large_observations(observations_path, points, online_calibs)
-
-    provider: VrsDataProvider = data_provider.create_vrs_data_provider(vrsfile)
-    # left_config = provider.get_image_configuration(StreamId("1201-1"))
-    # right_config = provider.get_image_configuration(StreamId("1201-2"))
-    # rgb_config = provider.get_image_configuration(StreamId("214-1"))
-    left_cam_calib  = provider.get_device_calibration().get_camera_calib("camera-slam-left")
-    right_cam_calib = provider.get_device_calibration().get_camera_calib("camera-slam-right")
-    rgb_cam_calib   = provider.get_device_calibration().get_camera_calib("camera-rgb")
-
-    new_calib = calibration.get_linear_camera_calibration(
-        512, 
-        512, 
-        256, "camera-rgb",rgb_cam_calib.get_transform_device_camera())
-    
-    vdbf = VDBFusionPipeline(out_dir       = head_f,
-                             sdf_trunc     = args.sdf_trunc,
-                             voxel_size    = args.voxel_size, 
-                             space_carving = True)
-
-    skip_start = 240*20
-    skip_end = 240*20
-    counts = skip_start - 1
-    valid_scan = 0
-    depth_model = get_depth_model()
-
-    extrinsics_sequence = []
-    timestamps_sequence = []
-    depth_sequence = []
-    rgb_sequence = []
-
-    for calib in tqdm(online_calibs[skip_start: -skip_end], desc="Processing"):
-        counts += 1
-        if counts not in observations_by_frame:
-            print(f"No observations by frame {counts}")
-            continue
-        device_time = calib.tracking_timestamp.total_seconds()
-        calib_l, calib_r, calib_rgb = calib.camera_calibs # calibration results
-        globa_pose  = get_nearest_pose(closed_loop_traj, int(device_time*1e9))
-
-        l, _, r, _, rgb, _ = get_stereo_image(provider, int(device_time*1e9), TimeDomain.DEVICE_TIME)
-
-        # new_calib  = get_updated_calib(calib_l, "left")
-        # left_img  = cv2.cvtColor(l.to_numpy_array(), cv2.COLOR_GRAY2RGB)
-        # undistorted_img  = undistort_image(left_img, new_calib, calib_l, "left")
-        # T_cam_world  = (globa_pose.transform_world_device @ new_calib.get_transform_device_camera()).inverse().to_matrix()
-
-        # new_calib = get_updated_calib(calib_r, "right")   
-        # right_img = cv2.cvtColor(r.to_numpy_array(), cv2.COLOR_GRAY2RGB)
-        # undistorted_img = undistort_image(right_img, new_calib, calib_r, "right")
-        # T_cam_world = (globa_pose.transform_world_device @ new_calib.get_transform_device_camera()).inverse().to_matrix()
-
-        # new_calib   = get_updated_calib(calib_rgb, "rgb")
-        rgb_img   = cv2.cvtColor(rgb.to_numpy_array(), cv2.COLOR_BGR2RGB)
-        undistorted_img   = undistort_image(rgb_img, new_calib, rgb_cam_calib, "rgb")
-        T_cam_world   = (globa_pose.transform_world_device @ new_calib.get_transform_device_camera()).inverse().to_matrix()
-
-        points = np.stack([obs[0] for obs in observations_by_frame[counts]])
-        u, v, depth = project_point_cloud_to_image(points, new_calib, T_cam_world)
-        depth_by_projection = remove_further_points_and_color(u,v, depth, 
-                                                            new_calib.get_image_size()[0], 
-                                                            new_calib.get_image_size()[1])   # (w, h)
-        depth = depth_model.infer_image(np.rot90(undistorted_img, -1), 518)
-        depth = np.rot90(depth, 1)
-        d_correct = get_depth_scale(depth_by_projection, depth)
-
-        if d_correct is None or np.any(d_correct < 0):
-            continue
-        
-        
-        # save all images
-        # overlay_image, _ = overlay_depth_on_image(undistorted_img, depth_by_projection) # rgb
-        # combined_result = cv2.hconcat([# np.rot90(undistorted_img, -1), 
-        #                                np.rot90(overlay_image, -1), 
-        #                                color_depth(depth, False, is_rot=True), 
-        #                                color_depth(d_correct, False, is_rot=True)])
-        
-        # cv2.imwrite(os.path.join(image_folder, f"{device_time:.6f}.png"), combined_result)
-
-        valid_scan += 1
-        scan = depth_point_cloud(d_correct, 
-                        undistorted_img, 
-                        new_calib, np.linalg.inv(T_cam_world),
-                        image_folder, f"{device_time:.6f}.pcd")
-        
-        extrinsics_sequence.append(np.linalg.inv(T_cam_world))
-        depth_sequence.append(d_correct)
-        rgb_sequence.append(undistorted_img)
-        timestamps_sequence.append(device_time*1e6)
-
-        if valid_scan % 3 == 0 and is_tsdf:
-            tic = time.perf_counter_ns()
-            vdbf.vdbvolume.integrate(np.asanyarray(scan.points), np.linalg.inv(T_cam_world))
-            vdbf.append_time(time.perf_counter_ns() - tic)
-
-        if valid_scan % 6000 == 0 and is_tsdf:
-            print(f"Saved {valid_scan} scans")
-            vdbf.save_to_disk()
-
-
-        # cv2.imshow("Overlay RGB", combined_result)
-
-        """
-        compute_depth_from_undistorted(undistorted_img, undistorted_img, left_new_calib, right_new_calib, "stereo")
-
-        undistorted_img = undistorted_img[:, 80:-80]
-        left_new_calib = calibration.get_linear_camera_calibration(
-                left_new_calib.get_image_size()[1], 
-                left_new_calib.get_image_size()[1], 
-                left_new_calib.get_focal_lengths()[0],
-                "crop_left",
-                SE3.from_matrix(pinhole_rgb.get_transform_device_camera().inverse().to_matrix() @ left_new_calib.get_transform_device_camera().to_matrix()))
-        
-        compute_depth_from_undistorted(undistorted_img, undistorted_img, pinhole_rgb, left_new_calib, "left-cam")
-
-        undistorted_img = undistorted_img[:, 80:-80]
-        right_new_calib = calibration.get_linear_camera_calibration(
-                right_new_calib.get_image_size()[1], 
-                right_new_calib.get_image_size()[1], 
-                right_new_calib.get_focal_lengths()[0],
-                "crop_left",
-                SE3.from_matrix(pinhole_rgb.get_transform_device_camera().inverse().to_matrix() @ right_new_calib.get_transform_device_camera().to_matrix()))
-        compute_depth_from_undistorted(undistorted_img, undistorted_img, pinhole_rgb, right_new_calib, "right-cam")
-        
-        cv2.waitKey(0)
-        """
-
-    with h5py.File('depth_sequence_parallel.h5', 'w') as f:
-        f.create_dataset('intrinsics', data=np.array([*new_calib.get_focal_lengths(), *new_calib.get_principal_point()]) )
-        f.create_dataset('depth_sequence', data=np.stack(depth_sequence), dtype=np.float32)
-        f.create_dataset('rgb_sequence', data=np.stack(rgb_sequence), dtype=np.float32)
-        f.create_dataset('extrinsics', data=np.stack(extrinsics_sequence), dtype=np.float32)
-        f.create_dataset('timestamps', data=np.stack(timestamps_sequence), dtype=np.int64)
-
-if __name__ == '__main__':
-    parser = configargparse.ArgumentParser()
-
-    parser.add_argument("--root_folder", type=str, 
-                        default="/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd",
-                        # default="D:\\Data\\20231222_s1_kenneth_fischer_act7_56uvqd",
-                        help="The data's root directory")
-
-    parser.add_argument("-VS", "--voxel_size", type=float, default=0.06, 
-                        help="The voxel filter parameter for TSDF fusion")
-    
-    parser.add_argument("-T", "--tsdf", type=bool, default=False)
-
-    parser.add_argument("--skip_frame", type=int, default=6, 
-                        help='The everay n frame used for mapping')
-    
-    parser.add_argument('--sdf_trunc', type=float, default=0.10,
-                        help="The trunction distance for SDF funtion")
-    
-    args, opts    = parser.parse_known_args()
-
-    main(args)
