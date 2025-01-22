@@ -1,0 +1,17 @@
+WEIGHT:
+    wt_ft_vel: 100
+    wt_ft_cont: 100
+    wt_rot_smth: 100
+    wt_trans_imu_smth: 100
+    wt_pose_prior: 100
+
+    init_vel_weight: 10
+    init_trans_weight: 150
+    init_rot_weight: 150
+
+OPT: 
+    learn_rate: 0.001
+    iterations: 200
+    window_frames: 300
+
+imu_smt_mode: 'XYZ'
