@@ -10,6 +10,8 @@ import os
 import sys
 from os.path import join
 
+import numpy as np
+
 SMPL_DIR = os.path.split(os.path.abspath( __file__))[0]
 
 SMPL_NEUTRAL = os.path.join(SMPL_DIR, 'smpl', 'SMPL_NEUTRAL.pkl')
@@ -240,10 +242,94 @@ bones=[(0,1), (1,4), (4,7), (7,10), # R leg
        (9,13), (13,16), (16,18), (18,20), (20,22), # R arm
        (9,14), (14,17), (17,19), (19,21), (21,23)] # L arm
 
-body_parts = {
-    'heads': [12, 15],
-    'torso': [3, 6, 9, 13, 14],
-    'legs' : [1, 2, 4, 5, 7, 8],
-    'arms' : [16, 17, 18, 19, 20, 21],
+body_idx = {
+    'neck': [12],
+    'head': [15],
+    'shold': [13, 14, 16, 17],
+    'u_arm': [18, 19],
+    'hands': [20, 21],
+    'torso': [3, 6, 9],
+    'hips' : [1, 2],
+    'knees': [4, 5],
+    'foot' : [7, 8],
     'ends' : [10, 11, 22, 23]
+}
+
+body_weight = np.asarray([1.] * 24).astype('float32')
+body_weight[body_idx['neck']]  = 0.8
+body_weight[body_idx['head']]  = 0.8
+body_weight[body_idx['shold']] = 0.8
+body_weight[body_idx['u_arm']] = 0.5
+body_weight[body_idx['hands']] = 0.1
+body_weight[body_idx['torso']] = 1.0
+body_weight[body_idx['hips']]  = 0.8
+body_weight[body_idx['knees']] = 0.4
+body_weight[body_idx['foot']]  = 0.1
+body_weight[body_idx['ends']]  = 0.1
+
+body_prior_weight = np.asarray([1.] * 24).astype('float32')
+body_prior_weight[body_idx['head']]  = 5
+body_prior_weight[body_idx['neck']]  = 5
+body_prior_weight[body_idx['hands']] = 1
+body_prior_weight[body_idx['foot']]  = 3
+body_prior_weight[body_idx['ends']]  = 5
+
+import json
+with open(os.path.join(SMPL_DIR, 'smpl_vert_segmentation.json')) as f:
+    verts_seg = json.load(f)
+
+torso     = []
+legs      = []
+feet      = []
+arms      = []
+hands     = []
+low_limbs = []
+
+for part in ['spine', 
+             'spine1', 
+             'spine2', 
+             'hips']:
+    torso += verts_seg[part]
+for part in ['leftLeg', 
+             'leftUpLeg', 
+             'rightLeg', 
+             'rightUpLeg']:
+    legs += verts_seg[part]
+for part in ['leftFoot', 
+             'leftToeBase', 
+             'rightFoot', 
+             'rightToeBase']:
+    feet += verts_seg[part]
+for part in ['leftArm', 
+             'leftForeArm', 
+             'leftShoulder', 
+             'rightArm', 
+             'rightShoulder', 
+             'rightForeArm']:
+    arms += verts_seg[part]
+for part in ['leftHandIndex1',
+             'leftHand', 
+             'rightHandIndex1', 
+             'rightHand',]:
+    hands += verts_seg[part]
+
+for part in ['rightForeArm', 
+             'leftForeArm', 
+             'leftLeg', 
+             'rightLeg']:
+    low_limbs += verts_seg[part]
+
+body_seg_verts = {
+    'torso'     : list(set(torso)),
+    'legs'      : list(set(legs)),
+    'feet'      : list(set(feet)),
+    'arms'      : list(set(arms)),
+    'hands'     : list(set(hands)),
+    'low_limbs' : list(set(low_limbs)),
+    'body'      : list(set(torso + verts_seg['leftUpLeg'] + verts_seg['rightUpLeg'])),
+    'head'      : list(set(verts_seg['neck'] + verts_seg['head'])),
+    'left_arm'  : list(set(verts_seg['leftForeArm'] + verts_seg['leftHand'] + verts_seg['leftHandIndex1'])),
+    'right_arm' : list(set(verts_seg['rightForeArm'] + verts_seg['rightHand'] + verts_seg['rightHandIndex1'])),
+    'left_leg'  : list(set(verts_seg['leftLeg'] + verts_seg['leftFoot'] + verts_seg['leftToeBase'])),
+    'right_leg' : list(set(verts_seg['rightLeg'] + verts_seg['rightFoot'] + verts_seg['rightToeBase']))
 }

@@ -32,12 +32,26 @@ sys.path.append(os.path.dirname(os.path.split(os.path.abspath( __file__))[0]))
 import ChamferDistancePytorch.chamfer3D.dist_chamfer_3D as cham
 distChamfer = cham.chamfer_3DDist()
 
-from tools import read_json_file
+from utils import read_json_file
 from smpl import axis_angle_to_rotation_matrix, rotation_matrix_to_axis_angle, BODY_PARTS as BP
 
 root_path = "/".join(os.path.abspath(__file__).split('/')[:-1])
 
 CONTACT_VERTS = None
+
+# list all losses func with __all__ set to
+__all__ = ['trans_imu_smooth', 
+           'joints_smooth', 
+           'compute_similarity_transform_torch',
+           'contact_constraint', 
+           'foot_collision', 
+           'sliding_constraint', 
+           'get_optmizer', 
+           'get_contacinfo', 
+           'mesh2point_loss', 
+           'points2smpl_loss', 
+           'collision_loss', 
+           'load_vertices']
 
 def load_vertices():
     global CONTACT_VERTS
@@ -686,13 +700,13 @@ def compute_vertex_normals(vertices, faces, unit=True):
 
     normals.index_add_(0, faces[:, 1].long(),
                        torch.cross(vertices_faces[:, 2] - vertices_faces[:, 1],
-                       vertices_faces[:, 0] - vertices_faces[:, 1]))
+                       vertices_faces[:, 0] - vertices_faces[:, 1], dim=-1))
     normals.index_add_(0, faces[:, 2].long(),
                        torch.cross(vertices_faces[:, 0] - vertices_faces[:, 2],
-                       vertices_faces[:, 1] - vertices_faces[:, 2]))
+                       vertices_faces[:, 1] - vertices_faces[:, 2], dim=-1))
     normals.index_add_(0, faces[:, 0].long(),
                        torch.cross(vertices_faces[:, 1] - vertices_faces[:, 0],
-                       vertices_faces[:, 2] - vertices_faces[:, 0]))
+                       vertices_faces[:, 2] - vertices_faces[:, 0], dim=-1))
 
     if unit:
         normals = F.normalize(normals, eps=1e-6, dim=1)

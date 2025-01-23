@@ -745,7 +745,7 @@ def mocap_to_smpl_axis(joints_angle,
     #     np.savetxt("first_joints.txt", j[0])
 
     if fix_orit:
-        delta_r = R.from_rotvec(mocap_smpl_rots[0,:3]).inv()  #使得第一帧永远朝前
+        delta_r = R.from_rotvec(mocap_smpl_rots[0,:3]).inv()  # makeing the first frame towards forward
         delta_r = R.from_euler('y', delta_r.as_euler('yxz')[0])
         degrees = delta_r.as_euler('yxz', degrees=True)[0]
         print(f'[Auto] Fix orientation error: Yaw {degrees:.1f} degrees.')

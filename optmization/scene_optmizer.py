@@ -17,61 +17,54 @@ import time
 import sys
 from glob import glob
 from copy import deepcopy
+import pickle as pkl
 
 import torch
 import numpy as np
-import pickle as pkl
-from torch.cuda.amp.grad_scaler import GradScaler
+from torch.amp.grad_scaler import GradScaler
 
 sys.path.append('.')
 sys.path.append('..')
 
 from wandb_tool import set_wandb, save_wandb, get_weight_loss
 
-from tool_func import loadLogger, load_scene_for_opt, lidar_to_root, crop_scene, get_lidar_to_head
+from tool_func import loadLogger, load_scene_for_opt, crop_scene, get_lidar_to_head as get_sensor_to_head
 from tool_func import check_nan, log_dict, set_foot_states, cal_global_trans
 
-from losses import get_optmizer, get_contacinfo
-from losses import sliding_constraint, contact_constraint, trans_imu_smooth, joints_smooth
-from losses import mesh2point_loss, points2smpl_loss, collision_loss, foot_collision
+from losses import *
 
 from smpl import SMPL_Layer, BODY_WEIGHT, BODY_PRIOR_WEIGHT
 from smpl import convert_to_6D_rot, rot6d_to_rotmat, rotation_matrix_to_axis_angle, rot6d_to_axis_angle
 
-from tools import read_json_file, poses_to_vertices_torch, select_visible_points, multi_func
+from utils import read_json_file, poses_to_vertices_torch, select_visible_points, multi_func
 
 def get_opt_params(s:int, e:int, params:list, delta_trans=None):
     """
-    It takes in the start and end indices of a sequence, and returns the corresponding lidar
-    translation (or from point cloud), mocap translation, mocap orientation, lidar orientation, and lidar trajectory
+    It takes in the start and end indices of a sequence, and returns the correspondingsensor
+    translation (or from point cloud), mocap translation, mocap orientation,sensor orientation, andsensor trajectory
     
     Args:
         s: start index
         e: end of the sequence
-        delta_trans: the translation offset between the lidar and the mocap.
+        delta_trans: the translation offset between thesensor and the mocap.
     
     Returns:
-        lidar_trans, trans, orientation, pose, lidar_traj
+       sensor_trans, trans, orientation, pose,sensor_traj
     """
-    # lidar_ori = self.lidar_ori[s:e].clone()
-    lidar_trans = params['lidar_trans'][s:e].clone()
-    trans       = params['mocap_trans'][s:e].clone()
-    orientation = convert_to_6D_rot(params['ori'][s:e].clone())
     # before_head = convert_to_6D_rot(self.before_head[s:e].clone().view(-1, 3))
     # head_rot    = convert_to_6D_rot(self.head_rot[s:e].clone())
     # after_head  = convert_to_6D_rot(self.after_head[s:e].clone().view(-1, 3))
-    pose        = convert_to_6D_rot(params['pose'][s:e].clone().view(-1, 3))
-    lidar_traj  = params['lidar_traj'][s:e].clone()
     
+    sensor_trans = params['sensor_trans'][s:e].clone()
     if delta_trans is not None:
-        lidar_trans += delta_trans
+       sensor_trans += delta_trans
 
     return {
-        'lidar_trans': lidar_trans,
-        'mocap_trans': trans,
-        'ori': orientation,
-        'pose': pose,
-        'lidar_traj': lidar_traj,
+        'sensor_trans': sensor_trans,
+        'mocap_trans': params['mocap_trans'][s:e].clone(),
+        'ori': convert_to_6D_rot(params['ori'][s:e].clone()),
+        'pose': convert_to_6D_rot(params['pose'][s:e].clone().view(-1, 3)),
+        'sensor_traj':params['sensor_traj'][s:e].clone(),
     }
 
 class Optimizer():
@@ -99,7 +92,7 @@ class Optimizer():
     def set_args(self, args, opt_file=None, logger_file=None):
         print('Setting arguments...')
 
-        self.lidar_pos = 15 if args.lidar_pos == 'Head' and self.person.lower(
+        self.sensor_pos = 15 if args.sensor_pos == 'Head' and self.person.lower(
         ) == 'first_person' else 0
         self.root_folder   = args.root_folder
         self.window_frames = args.window_frames
@@ -123,7 +116,7 @@ class Optimizer():
         self.w['pose_prior'] = args.wt_pose_prior
         self.w['jts_smth']   = args.wt_joints_smth
         self.w['pen_loss']   = args.wt_pen_loss
-        self.w['l2h']        = args.wt_lidar2head
+        self.w['l2h']        = args.wt_sensor2head
         self.w['coll']       = args.wt_coll_loss
             
         self.w['cat_sld']    = args.cat_sliding_weight
@@ -151,13 +144,13 @@ class Optimizer():
         # load scene for optimization
         if self.scene is None:
             try:
-                self.scene = glob(self.root_folder + '/lidar_data/*frames.ply')[0]
+                self.scene = glob(self.root_folder + '/synced_data/*frames.ply')[0]
             except:
                 self.logger.error('No default scene file!!!')
                 exit(0)
 
         elif not os.path.exists(self.scene):
-            self.scene = os.path.join(self.root_folder, 'lidar_data', self.scene)
+            self.scene = os.path.join(self.root_folder, 'sensor_data', self.scene)
 
         if not os.path.exists(self.scene):
             self.logger.error('No scene file!!!')
@@ -169,13 +162,13 @@ class Optimizer():
 
         return opt_file, logger_file
 
-    def update_pkl_data(self, opt_data_file, lidar_T, mocap_rots, start, end):
+    def update_pkl_data(self, opt_data_file,sensor_t, mocap_rots, start, end):
         """
         `update_pkl_data` updates the `synced_data` dictionary with the optimized pose and translation
         parameters, and then saves the updated dictionary to a pickle file
 
         Args:
-          lidar_T: the translation parameters of the lidar
+          sensor_t: the translation parameters of thesensor
           mocap_rots: the optimized mocap rotations
           start: the start index of the data to be updated
           end: the index of the last frame to be optimized
@@ -183,7 +176,7 @@ class Optimizer():
         self.logger.info(f"Updated in: {os.path.basename(opt_data_file)}")
 
         # update original data
-        self.synced_lidar[start: end] = lidar_T.detach().cpu().numpy()
+        self.synced_sensor[start: end] = sensor_t.detach().cpu().numpy()
         if len(mocap_rots.shape) >= 3:
             mocap_rots = mocap_rots.reshape(-1, 3, 3)
             mocap_rots = rotation_matrix_to_axis_angle(mocap_rots).reshape(-1, 72)
@@ -194,10 +187,10 @@ class Optimizer():
 
         if 'opt_pose' not in person_data:
             person_data['opt_pose']  = self.synced_smpl_pose
-            person_data['opt_trans'] = self.synced_lidar
+            person_data['opt_trans'] = self.synced_sensor
         else:
             person_data['opt_pose'][start: end]  = mocap_rots.detach().cpu().numpy()
-            person_data['opt_trans'][start: end] = lidar_T.detach().cpu().numpy()
+            person_data['opt_trans'][start: end] = sensor_t.detach().cpu().numpy()
 
         with open(opt_data_file, 'wb') as f:
             pkl.dump(self.synced_data, f)
@@ -205,7 +198,7 @@ class Optimizer():
     def initialize_data(self, person='first person'):
         """
         It loads the data from the pickle file, sets the start and end frames for optimization, sets the
-        lidar offset, creates the SMPL layer, and sets the foot states
+       sensor offset, creates the SMPL layer, and sets the foot states
 
         Args:
           person: the person you want to optimize.
@@ -217,11 +210,11 @@ class Optimizer():
             synced_data = pkl.load(f)
             self.logger.info(f'Load data in {self.synced_data_file}')
 
-        human_data            = synced_data[person]
-        self.frame_id         = np.array(synced_data['frame_num'])
-        self.data_length      = len(self.frame_id)
-        self.frame_time       = synced_data['first_person']['lidar_traj'][:, -1]
-        self.lidar_frame_rate = dataset_params['lidar_framerate']
+        human_data             = synced_data[person]
+        self.frame_id          = np.array(synced_data['frame_num'])
+        self.data_length       = len(self.frame_id)
+        self.frame_time        = synced_data['device_ts']    
+        self.sensor_frame_rate = dataset_params['lidar_framerate']
 
         # ==================== the params used to optimize ====================
         if 'manual_pose' in human_data:
@@ -231,13 +224,12 @@ class Optimizer():
             self.synced_smpl_pose = human_data['pose'].copy()           # (n, 24, 3)
         self.synced_imu_trans = human_data['mocap_trans'].copy()        # (n, 3)
 
-        # x, y, z
-        if 'lidar_traj' in human_data:
-            # idx, X, Y, Z, qx, qy, qz, qw, timestamp
-            self.synced_lidar = human_data['lidar_traj'][:, 1:4].copy() 
-        else:
-            # ICP results with point cloud
-            self.synced_lidar = human_data['trans'].copy()          # (n, 24, 3)
+        if 'T_sensor_head' in human_data:
+            self.sensor2head = torch.tensor(human_data['T_sensor_head']).inverse().float()
+
+        # translation drived from the sensor (camera of lidar)
+        self.synced_sensor = human_data['trans'].copy()  # (n, 3)   
+        self.sensor_traj = human_data['lidar_traj'][:, 1:4].copy()  
 
         if 'beta' in human_data:
             self.betas = torch.from_numpy(np.array(human_data['beta'])).float()
@@ -265,11 +257,11 @@ class Optimizer():
         self.rfoot_move = set_foot_states(
             human_data['pose'][s:e],
             human_data['mocap_trans'][s:e].copy(),
-            1/self.lidar_frame_rate,
+            1/self.sensor_frame_rate,
             self.betas,
             self.gender)
 
-        self.logger.info('[Init] Mocap pose, mocap trans and LiDAR trajectory ready.')
+        self.logger.info('[Init] Mocap pose, mocap trans andsensor trajectory ready.')
 
         try:
             # pc = o3d.geometry.PointCloud()
@@ -296,7 +288,7 @@ class Optimizer():
     def get_init_params(self, start, end):
         """
         It takes in the start and end indices of the data, 
-        and returns the lidar and mocap data in the form
+        and returns thesensor and mocap data in the form
         of torch tensors
 
         Args:
@@ -312,8 +304,8 @@ class Optimizer():
         if end > self.data_length:
             end = self.data_length
 
-        # lidar_ori_params = torch.from_numpy(self.synced_lidar[start: end, 4:8])
-        lidar_T = torch.from_numpy(self.synced_lidar[start: end])
+        #sensor_ori_params = torch.from_numpy(self.synced_sensor[start: end, 4:8])
+        sensor_t = torch.from_numpy(self.sensor_traj[start: end])
 
         mocap_trans_params = torch.from_numpy(
             self.synced_imu_trans[start: end])
@@ -322,8 +314,8 @@ class Optimizer():
         ori_params  = smpl_params[:, :3]
         pose_params = smpl_params[:, 3:]
 
-        # lidar_ori_params.requires_grad = False
-        lidar_T.requires_grad            = False
+        #sensor_ori_params.requires_grad = False
+        sensor_t.requires_grad           = False
         # smpl_params.requires_grad      = False
         mocap_trans_params.requires_grad = False
         ori_params.requires_grad         = False
@@ -335,54 +327,24 @@ class Optimizer():
         if self.is_cuda:
             self.smpl_layer.cuda()
             self.betas         = self.betas.unsqueeze(0).type(torch.FloatTensor).cuda()
-            # lidar_ori_params = lidar_ori_params.type(torch.FloatTensor).cuda()
-            lidar_T            = lidar_T.type(torch.FloatTensor).cuda()
+            #sensor_ori_params =sensor_ori_params.type(torch.FloatTensor).cuda()
+            sensor_t           = sensor_t.type(torch.FloatTensor).cuda()
             mocap_trans_params = mocap_trans_params.type(torch.FloatTensor).cuda()
             ori_params         = ori_params.type(torch.FloatTensor).cuda()
             pose_params        = pose_params.type(torch.FloatTensor).cuda()
 
-        pose = torch.cat([ori_params, pose_params], dim=1)
-        if self.person.lower() == 'first_person':
-            _, joints, global_rots = poses_to_vertices_torch(
-                pose, batch_size=1024, 
-                trans=mocap_trans_params, 
-                betas=self.betas, 
-                gender=self.gender)
-            offset_lidar_T = lidar_to_root(lidar_T, joints, global_rots, index=self.lidar_pos)
-            offset_lidar_T += mocap_trans_params[0] - joints[0, 0]
-        else:
-            offset_lidar_T = lidar_T
-
-        # lidar_ori_params
-        return {'lidar_trans': offset_lidar_T,
-                'mocap_trans': mocap_trans_params,
+        #sensor_ori_params
+        return {'sensor_trans': sensor_t,   # translation from the camera
+                'mocap_trans': mocap_trans_params,  # translation from the imu
                 'ori': ori_params,
                 'pose': pose_params,
-                'lidar_traj': lidar_T}
+                'sensor_traj':sensor_t}
 
     def divide_traj(self, person, dataset_params, skip=100):
 
-        lidar_fr   = dataset_params['lidar_framerate']
-        fisrt_jump = dataset_params['lidar_sync'][0]
+        sensor_fr   = dataset_params['lidar_framerate']
 
-        if person in dataset_params:
-            try:
-                mocap_jumps = dataset_params[person]['mocap_sync']
-            except Exception as e:
-                mocap_jumps = []
-
-            jump_list = []
-            for i in range(len(mocap_jumps)):
-                jump_time = mocap_jumps[i] - mocap_jumps[0] + fisrt_jump
-                tt        = abs(self.frame_time - jump_time)
-                jump      = np.where(tt == tt.min())[0][0]
-                jump_list += np.arange(
-                    jump - lidar_fr//4, jump + lidar_fr//4).astype(np.int64).tolist()
-
-            jump_list = list(set(jump_list))
-            jump_list = sorted(jump_list, key=lambda x: int(x))
-        else:
-            jump_list = []
+        jump_list = []
 
         sub_segment_idx = np.arange(
             self.opt_start, self.opt_end, self.window_frames).tolist()
@@ -398,7 +360,7 @@ class Optimizer():
 
     def cal_loss(self, params):
         """
-        It takes in the predicted vertices, the predicted global transformation, and the type of loss (LiDAR
+        It takes in the predicted vertices, the predicted global transformation, and the type of loss (Sensor
         or MoCap) and returns the contact loss, the sliding loss, the number of frames that have contact
         loss, the number of frames that have sliding loss, and the localization loss
         
@@ -427,21 +389,21 @@ class Optimizer():
         # ground = self.scene_ground
 
         ground = crop_scene(self.scene_ground,
-                            seg_params['lidar_trans'].cpu().numpy(), self.radius)
+                            seg_params['sensor_trans'].cpu().numpy(), self.radius)
 
         mocap_rots = torch.cat([rot6d_to_rotmat(seg_params['ori']).view(-1, 1, 9),
                                 rot6d_to_rotmat(seg_params['pose']).view(-1, 23, 9)], dim=1)
 
-        def process(verts, trans, ltype='LiDAR'):
+        def process(verts, trans, ltype='SENSOR'):
             """
             > This function takes in the predicted vertices, the predicted global transformation, and the type
-            of loss (LiDAR or MoCap) and returns the contact loss, the sliding loss, the number of frames that
+            of loss (SENSOR or MoCap) and returns the contact loss, the sliding loss, the number of frames that
             have contact loss, the number of frames that have sliding loss, and the localization loss
 
             Args:
               verts: the vertices of the mesh
-              trans: the translation of the LiDAR in the world frame
-              ltype: the type of loss, either 'LiDAR' or 'mocap'. Defaults to LiDAR
+              trans: the translation of thesensor in the world frame
+              ltype: the type of loss, either 'SENSOR' or 'mocap'. Defaults tosensor
             """
             loss_trans = cal_global_trans(mocap_rots, trans, is_cuda=True)
             contac_loss, contac_num   = contact_constraint(verts, contact_info, self.shoes_height)
@@ -452,10 +414,10 @@ class Optimizer():
             sliding_num = [n + self.frame_id[0] +
                            self.opt_start for n in sliding_num]
 
-            if ltype.lower() == 'lidar':
+            if ltype.lower() == 'sensor':
                 if self.person == 'first_person':
                     self.logger.info(
-                        f'LiDAR to head: {1000*torch.norm(self.lidar2head).item():.1f} (mm)')
+                        f'Sensor to head: {1000*torch.norm(self.sensor2head[:3, 3]).item():.1f} (mm)')
                 self.logger.info(f'Type\tContact\tSliding\tLocali')
 
             print_str = f'{ltype}\t' + \
@@ -472,19 +434,16 @@ class Optimizer():
 
         with torch.no_grad():
             smpl_verts, joints, global_rots = poses_to_vertices_torch(
-                mocap_rots, seg_params['lidar_trans'], betas=self.betas, gender=self.gender)
+                mocap_rots, seg_params['sensor_trans'], betas=self.betas, gender=self.gender)
             lowest_height = torch.min(smpl_verts[:20,:, -1], dim=-1)[0].mean() - self.shoes_height
-            self.lidar2head = get_lidar_to_head(joints[:20, 15], global_rots[:20, 15], 
-                                                seg_params['lidar_traj'][:20],
-                                                lowest_height).mean(0)
 
             contact_info = get_contacinfo(
                 foot_states, jump_list, ground, smpl_verts)
 
-            # lidar
-            process(smpl_verts, seg_params['lidar_trans'], 'LiDAR')
+            #sensor
+            process(smpl_verts, seg_params['sensor_trans'], 'Sensor')
             # Mocap
-            smpl_verts += seg_params['mocap_trans'].unsqueeze(1) - seg_params['lidar_trans'].unsqueeze(1)
+            smpl_verts += seg_params['mocap_trans'].unsqueeze(1) - seg_params['sensor_trans'].unsqueeze(1)
             process(smpl_verts, seg_params['mocap_trans'], 'IMU')
 
             del smpl_verts, joints, global_rots, contact_info
@@ -492,16 +451,16 @@ class Optimizer():
         # if self.human_points:
         #     self.vis_smpl_idx = [[] * (end - start)]
         #     # ! icp_mesh_and_point
-        #     lidar_pose = self.synced_data['first_person']['lidar_traj'][start:end, 1:8]
+        #     sensor_pose = self.synced_data['first_person']['sensor_traj'][start:end, 1:8]
         #     smpl_verts_np = smpl_verts.cpu().numpy()
         #     self.vis_smpl_idx = multi_func(select_visible_points, 8, end-start, 'select_visible_points',
-        #                                 False, smpl_verts_np, lidar_pose, print_progress=True)
+        #                                 False, smpl_verts_np, sensor_pose, print_progress=True)
 
             # for f in tqdm(range(start, end), desc='ICP mesh2points'):
             #     if f in self.human_points.keys():
             #         deltaT = icp_mesh2point(
-            #             smpl_verts_np[f-start], self.human_points[f], lidar_pose[f-start], self.vis_smpl_idx[f-start])
-            #         opt_params['lidar_trans'][f] += torch.from_numpy(deltaT).float().cuda()
+            #             smpl_verts_np[f-start], self.human_points[f], sensor_pose[f-start], self.vis_smpl_idx[f-start])
+            #         opt_params['sensor_trans'][f] += torch.from_numpy(deltaT).float().cuda()
         self.logger.info('===============================================')
 
 
@@ -527,7 +486,7 @@ class Optimizer():
 
         # todo: 改成 limbs和orientation可以求导，orientation仅绕Z轴方向求导
         smpl_verts, joints, global_rots = self.smpl_layer(
-            mocap_rots, opt_params['lidar_trans'], self.betas)
+            mocap_rots, opt_params['sensor_trans'], self.betas)
 
         sum_loss, print_str, loss_chart = 0, [], {}
 
@@ -551,7 +510,7 @@ class Optimizer():
                                       self.w['coll'], 'coll')
         # =============  scene-aware terms =====================
 
-        # =============  2. (mesh to point) / (lidar to body) loss =====================
+        # =============  2. (mesh to point) / (sensor to body) loss =====================
         if self.human_points and self.w['m2p'] >= 0:
             try:
                 contact_loss = np.stack([i.item() for i in ll[0]]).mean()
@@ -562,7 +521,7 @@ class Optimizer():
                 self.vis_smpl_idx[start:end] = multi_func(
                     select_visible_points, 8, end-start, '', False, 
                     smpl_verts.detach().cpu().numpy(), 
-                    self.synced_data['first_person']['lidar_traj'][start:end, 1:8],  
+                    self.synced_data['first_person']['sensor_traj'][start:end, 1:8],  
                     print_progress=False)
 
             # visible smpl to points
@@ -595,15 +554,15 @@ class Optimizer():
                 
                 sum_loss += add_loss_item(ll, self.w['p2m'], 'p2m')
                 
-        #  lidar_center_to_head CD loss
+        # sensor_center_to_head CD loss
         if self.w['l2h'] >= 0 and self.person == 'first_person':
-            pred_l2h = get_lidar_to_head(joints[:, 15], global_rots[:, 15], opt_params['lidar_traj'])
-            loss = torch.abs(pred_l2h - self.lidar2head).sum(-1)
-            loss = add_loss_item([loss, np.arange(end - start).tolist()], self.w['l2h'], 'lidar')
+            pred_l2h = get_sensor_to_head(joints[:, 15], global_rots[:, 15], opt_params['sensor_traj'])
+            loss = torch.abs(pred_l2h - self.sensor2head).sum(-1)
+            loss = add_loss_item([loss, np.arange(end - start).tolist()], self.w['l2h'], 'sensor')
 
             if self.w['l2h'] > 0:
                 sum_loss += loss
-        # =============  (mesh to point) / (lidar to body) loss =====================
+        # =============  (mesh to point) / (sensor to body) loss =====================
 
         # =============  3. self-constraint loss =====================
         # too slow
@@ -657,10 +616,10 @@ class Optimizer():
         # translation smooth loss
         if self.w['trans_smth'] >= 0:
             loss = trans_imu_smooth(
-                opt_params['lidar_trans'].squeeze(1),
+                opt_params['sensor_trans'].squeeze(1),
                 jump_list,
                 self.imu_smt_mode,
-                0.02/self.lidar_frame_rate)
+                0.02/self.sensor_frame_rate)
 
             loss = add_loss_item(loss, self.w['trans_smth'], 'trans')
 
@@ -701,12 +660,12 @@ class Optimizer():
         if sub_seg > 0:
             # concancatation translation loss
             if self.w['cat_trans'] >= 0:
-                acc = opt_params['lidar_trans'][0] - 2 * \
-                    self.pre_lidar_T[1] + self.pre_lidar_T[0]
+                acc = opt_params['sensor_trans'][0] - 2 * \
+                    self.pre_sensor_t[1] + self.pre_sensor_t[0]
                 loss1 = torch.nn.functional.relu(torch.norm(acc) - 1e-4)
-                acc = opt_params['lidar_trans'][1] - 2 * opt_params['lidar_trans'][0] + self.pre_lidar_T[1]
+                acc = opt_params['sensor_trans'][1] - 2 * opt_params['sensor_trans'][0] + self.pre_sensor_t[1]
                 loss2 = torch.nn.functional.relu(torch.norm(acc) - 1e-4)
-                # trans = lidar_T[0] - self.pre_lidar_T[1]
+                # trans = sensor_t[0] - self.pre_sensor_t[1]
                 # loss = torch.nn.functional.relu(torch.norm(trans) - 1e-4)
                 loss = add_loss_item(
                     [[loss1, loss2], [0, 1]], self.w['cat_trans'], 'trans', True)
@@ -770,7 +729,7 @@ class Optimizer():
         loss_dict   = {'start': [], 'end': [], 'time': []}
         delta_trans = None
 
-        scaler = GradScaler()
+        scaler = GradScaler("cuda")
 
         # Optmize all windows
         for i in range(len(self.sub_segment_idx) - 1):
@@ -792,7 +751,7 @@ class Optimizer():
                     jump_list.append(jl - start)
 
             scene_grids = crop_scene(
-                self.scene_ground, opt_params['lidar_trans'].cpu().numpy(), self.radius)
+                self.scene_ground, opt_params['sensor_trans'].cpu().numpy(), self.radius)
 
             self.logger.info(
                 f'=========[Segments {i+1}/{len(self.sub_segment_idx) - 1}], ' + 
@@ -806,25 +765,25 @@ class Optimizer():
             while True:
                 if iters == 0:  # Optimize global translation
                     optimizer = get_optmizer('trans', 
-                                             [opt_params['lidar_trans']], 
+                                             [opt_params['sensor_trans']], 
                                              self.learn_rate)
                     
                 elif iters == self.stage['ort']: # Now optimize global orientation
                     optimizer = get_optmizer('trans / orit',
-                                             [opt_params['lidar_trans'], 
+                                             [opt_params['sensor_trans'], 
                                               opt_params['ori']],
                                              self.learn_rate)
 
                 elif iters == self.stage['pose']: # Now optimize full SMPL pose
                     optimizer = get_optmizer('trans / orit / pose',
-                                             [opt_params['lidar_trans'], 
+                                             [opt_params['sensor_trans'], 
                                               opt_params['ori'], 
                                               opt_params['pose']],
                                              self.learn_rate)
 
                 elif iters == self.stage['all_loss']: # Now optimize the pose with all losses
                     optimizer = get_optmizer('trans / orit / pose  with all loss functions', 
-                                             [opt_params['lidar_trans'], 
+                                             [opt_params['sensor_trans'], 
                                               opt_params['ori'], 
                                               opt_params['pose']], 
                                              self.learn_rate)
@@ -861,10 +820,10 @@ class Optimizer():
 
                 if check_nan(ori=opt_params['ori'], 
                              pose=opt_params['pose'], 
-                             trans=opt_params['lidar_trans']):
+                             trans=opt_params['sensor_trans']):
                     count = 100
                 else:
-                    params['trans'] = opt_params['lidar_trans'].clone().detach()
+                    params['trans'] = opt_params['sensor_trans'].clone().detach()
                     params['mocap'] = opt_params['mocap_trans'].clone().detach()
                     params['ori']   = opt_params['ori'].clone().detach()
                     params['pose']  = opt_params['pose'].clone().detach()
@@ -883,11 +842,11 @@ class Optimizer():
                     mocap_rots = torch.cat([rot6d_to_rotmat(params['ori']).view(-1, 1, 9),
                                             rot6d_to_rotmat(params['pose']).view(-1, 23, 9)], dim=1)
 
-                    self.pre_lidar_T = params['trans'][-2:]
+                    self.pre_sensor_t = params['trans'][-2:]
                     self.pre_ori     = params['ori'][-2:]
                     self.pre_pose    = params['pose'][-2*23:]
                     self.pre_verts, self.pre_joints, _ \
-                        = self.smpl_layer(mocap_rots[-2:], self.pre_lidar_T, self.betas)
+                        = self.smpl_layer(mocap_rots[-2:], self.pre_sensor_t, self.betas)
 
                     self.logger.info(info)
 
@@ -898,11 +857,11 @@ class Optimizer():
             delta_trans, _ = log_dict(self.logger,
                                       loss_dict,
                                       params['trans'],
-                                      init_params['lidar_trans'][start:end],
+                                      init_params['sensor_trans'][start:end],
                                       rot6d_to_axis_angle(params['ori']),
                                       init_params['ori'][start:end])
 
-            self.update_pkl_data(opt_data_file, opt_params['lidar_trans'], mocap_rots, start, end)
+            self.update_pkl_data(opt_data_file, opt_params['sensor_trans'], mocap_rots, start, end)
 
             self.logger.info(
                 '================================================================')
@@ -910,7 +869,7 @@ class Optimizer():
         if self.person == 'first_person':
             try:
                 loss_trans = cal_global_trans(
-                    self.synced_smpl_pose, self.synced_lidar)
+                    self.synced_smpl_pose, self.synced_sensor)
                 self.logger.info(f'opt localization loss: {loss_trans:.3f}')
             except Exception as e:
                 self.logger.warning(f'{e.args[0]}')
@@ -944,7 +903,7 @@ def config_parser(is_optimization=False):
         parser.add_argument("--wt_trans_smth",  type=float, default=100)
         parser.add_argument("--wt_joints_smth", type=float, default=100)
         parser.add_argument("--wt_pose_prior",  type=float, default=500)
-        parser.add_argument("--wt_lidar2head",  type=float, default=500)
+        parser.add_argument("--wt_sensor2head",  type=float, default=500)
         parser.add_argument("--wt_coll_loss",   type=float, default=200,
                             help= "body-scene collision loss weight")
         parser.add_argument("--wt_pen_loss",    type=float, default=60, 
@@ -968,14 +927,14 @@ if __name__ == '__main__':
 
     parser = config_parser(True)
 
-    parser.add_argument('--root_folder', type=str, default='/humandata_4t/HSC4D2/0417_shiyanlou_wx_03', 
+    parser.add_argument('--root_folder', type=str, default="/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd", 
                         help="data folder's directory path")
 
     parser.add_argument('--scene', type=str, default=None, 
                         help="scene path for optimization")
 
-    parser.add_argument('--lidar_pos', type=str, default='Head', 
-                        help="the Lidar to the nearest body position to the SMPL Model")
+    parser.add_argument('--sensor_pos', type=str, default='Head', 
+                        help="the sensor to the nearest body position to the SMPL Model")
 
     parser.add_argument('--opt_file', type=str, default=None, 
                         help="the path of the optimization pkl file")
@@ -1011,20 +970,9 @@ if __name__ == '__main__':
     print('File path: ', args.root_folder)
 
     if args.opt_file is None or args.logger_file is None:
-        try:
-            print('====== Run first person optimization ======')
-            optimizer = Optimizer(person='first_person')
-            opt_file, logger_file = optimizer.set_args(args)
-            optimizer.run(opt_file)
-
-        except Exception as e:
-            opt_file, logger_file = None, None
-            import traceback
-            traceback.print_exc()
-
-        print('====== Run second person optimization ======')
-        optimizer = Optimizer(person='second_person')
-        opt_file, _ = optimizer.set_args(args, opt_file, logger_file)
+        print('====== Run first person optimization ======')
+        optimizer = Optimizer(person='first_person')
+        opt_file, logger_file = optimizer.set_args(args)
         optimizer.run(opt_file)
     else:
         opt_file = os.path.join(args.root_folder, 'log', args.opt_file)

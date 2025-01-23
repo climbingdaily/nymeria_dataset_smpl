@@ -24,7 +24,7 @@ import sys
 sys.path.append('.')
 sys.path.append('..')
 
-from tools import read_json_file, load_point_cloud, MOCAP_INIT, poses_to_vertices_torch
+from utils import read_json_file, load_point_cloud, MOCAP_INIT, poses_to_vertices_torch
 
 __all__ = ['find_stable_foot', 
            'crop_scene',
@@ -290,39 +290,6 @@ def get_lidar_to_head(joints, rots, lidar_traj, lowest_height=None, revert=True)
         global_head_rot = global_head_rot.transpose(2, 1)
     lidar2head = torch.einsum('bij, bj->bi', global_head_rot, lidar2head)
     return lidar2head
-
-def lidar_to_root(lidar_trans, joints, global_rots, index=15, is_cuda=True):
-    """
-    Given the lidar translation, the joint positions, and the joint rotations, we can compute the
-    translation of the root joint in the lidar frame
-    
-    Args:
-      lidar_trans: the translation of the lidar in the lidar frame
-      joints: the joint positions of the skeleton
-      global_rots: the global rotation matrix for each joint
-      index: the index of the joint to use for the transformation. Defaults to 15
-      is_cuda: whether to use GPU or not. Defaults to True
-    
-    Returns:
-      The translation of the root joint in the lidar frame.
-    """
-
-    # _, joints, global_rots = poses_to_vertices_torch(pose, batch_size=1024, trans=trans, is_cuda=is_cuda)
-    
-    root = joints[:, 0]
-    joint = joints[:, index]
-
-    matrot = torch.from_numpy(MOCAP_INIT).float()
-    if is_cuda:
-        matrot = matrot.cuda()
-    joint_rots = global_rots[:, index] @ matrot
-
-    # use the first frame's joint positions to lidar postion as the translation
-    lidar_to_joint = joint_rots @ joint_rots[0].T @ (joints[0, index] - lidar_trans[0])
-
-    lidar_to_root_trans = lidar_trans + lidar_to_joint + (root - joint)
-
-    return lidar_to_root_trans
 
 def check_nan(**args):
     has_nan = False

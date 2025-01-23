@@ -381,7 +381,7 @@ if __name__ == '__main__':
     
     # define T_head_aria
     T_head_aria = nd_lodaer.recording_head.vrs_dp.get_device_calibration().get_transform_cpf_sensor("camera-slam-left").to_matrix()
-    T_head_aria[:3, 3] = np.array([0.067, 0.091, 0.085])
+    T_head_aria[:3, 3] = np.array([0.067, 0.091, 0.037])
     T_sensor_head = np.linalg.inv(T_head_aria)  # transformation from head to aria
     print(f"Transformation from head to aria: \n{T_sensor_head}")
 
@@ -390,7 +390,7 @@ if __name__ == '__main__':
     # --------------------------------------------
     # 4. Synchronize the camera data
     # --------------------------------------------
-    vis_cam = True
+    vis_cam = False
     if vis_cam:
         calib_head   = nd_lodaer.recording_head.vrs_dp.get_device_calibration().get_camera_calib("camera-rgb")
         new_calib_head = calibration.get_linear_camera_calibration(
