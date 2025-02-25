@@ -51,7 +51,75 @@ __all__ = ['trans_imu_smooth',
            'mesh2point_loss', 
            'points2smpl_loss', 
            'collision_loss', 
-           'load_vertices']
+           'load_vertices',
+           'cam_loss']
+
+def chamfer_distance_x2y(x, y):
+    """
+    Args:
+        x: Tensor of shape (B, N, D).
+        y: Tensor of shape (B, M, D).
+    """
+    # Compute pairwise distances between each point in x and y
+    distances = torch.sum((x[:, :, None] - y[:, None]) ** 2, dim=-1)
+
+    # Find the nearest neighbor in y for each point in x
+    min_distances, _ = distances.min(dim=-1)
+
+    # # Find the nearest neighbor in x for each point in y
+    min_distances2, _ = distances.min(dim=1)
+
+    return min_distances[0], min_distances2[0]
+
+def iou_loss(points_coord, mask_coord, min_pixel_dist = 1):
+    """
+    The function calculates the intersection over union (IOU) loss between two sets of points and masks.
+    
+    Args:
+      points_coord: A tensor containing the coordinates of points in the predicted mask.
+      mask_coord: The coordinates of the mask, which is typically a binary image indicating the region
+    of interest.
+      min_pixel_dist: The minimum distance (in pixels) between a point and a mask for them to be
+    considered as intersecting. If the distance is less than this value, they are considered as
+    non-intersecting. Defaults to 1
+    
+    Returns:
+      two values: iou_loss1 and iou_loss2.
+    """
+    # chamLoss = cham.chamfer_2DDist()
+    # dist1, dist2, idx1, idx2 = chamLoss(points_coord, mask_coord)
+
+    p2m, m2p = chamfer_distance_x2y(points_coord, mask_coord)
+
+    non_inter_points = loss_filter(torch.relu(p2m - (min_pixel_dist ** 2 + 1e-4))).sum()
+    non_inter_mask = loss_filter(torch.relu(m2p - (5 ** 2 + 1e-4))).sum()
+
+    iou_loss1 = non_inter_points / len(p2m)
+    iou_loss2 = non_inter_mask / len(m2p)
+    iou_loss = (non_inter_mask + non_inter_points) / (non_inter_points + non_inter_mask + len(m2p))
+    return iou_loss1, iou_loss2, iou_loss
+
+def cam_loss(mask, vertices, intrinsic, extrinsic):
+    """
+    It calculates the camera loss based on the given mask, vertices, intrinsic, and extrinsic matrices.
+    
+    Args:
+      mask (torch.Tensor): A binary mask indicating the valid vertices.
+      vertices (torch.Tensor): The 3D vertices of the mesh.
+      intrinsic (torch.Tensor): The intrinsic camera matrix.
+      extrinsic (torch.Tensor): The extrinsic camera matrix.
+    
+    Returns:
+      A scalar representing the camera loss.
+    """
+    # project vertices to image plane
+    cam_vertices = intrinsic @ extrinsic @ vertices.unsqueeze(1)
+    cam_vertices = cam_vertices[:, :, :2] / cam_vertices[:, :, 2:]
+    
+    # calculate loss
+    # mask = mask.unsqueeze(2).expand(-1, -1, 2)
+    loss = iou_loss(cam_vertices, mask.unsqueeze(0))
+    return loss
 
 def load_vertices():
     global CONTACT_VERTS

@@ -325,6 +325,8 @@ body_seg_verts = {
     'feet'      : list(set(feet)),
     'arms'      : list(set(arms)),
     'hands'     : list(set(hands)),
+    'leftHand'  : list(set(verts_seg['leftHandIndex1'] + verts_seg['leftHand'])),
+    'rightHand' : list(set(verts_seg['rightHandIndex1'] + verts_seg['rightHand'])),
     'low_limbs' : list(set(low_limbs)),
     'body'      : list(set(torso + verts_seg['leftUpLeg'] + verts_seg['rightUpLeg'])),
     'head'      : list(set(verts_seg['neck'] + verts_seg['head'])),

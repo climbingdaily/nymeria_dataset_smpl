@@ -23,10 +23,11 @@ from projectaria_tools.core.sensor_data import (
 sys.path.append(dirname(split(abspath( __file__))[0]))
 
 from nymeria.data_provider import NymeriaDataProvider
-from nymeria.handeye import HandEyeSolver
+# from nymeria.handeye import HandEyeSolver
 from utils import poses_to_joints, mocap_to_smpl_axis, sync_lidar_mocap, poses_to_vertices_torch
 from utils import save_json_file, read_json_file, print_table, compute_similarity
 from utils.cam_tool import *
+from smpl import BODY_PARTS
 
 field_fmts = ['%d', '%.6f', '%.6f', '%.6f', '%.6f', '%.6f', '%.6f', '%.6f', '%.3f']
 
@@ -63,7 +64,7 @@ def finetune_first_person_data(synced_data_file, sensor_traj, T_sensor_head, ret
 
         fp_data['lidar_traj'] = sensor_traj
 
-        _, j, glo_rot = poses_to_vertices_torch(first_pose, mocap_tran, is_cuda=False)
+        _, j, glo_rot = poses_to_vertices_torch(first_pose, mocap_tran, betas=np.array(fp_data['beta']), gender=fp_data['gender'], is_cuda=False)
 
         # save smpl head trajectory
         smpl_head_traj = np.concatenate((save_data['frame_num'].reshape(-1, 1), j[:, 15].cpu().numpy()), axis=1)
@@ -104,6 +105,19 @@ def finetune_first_person_data(synced_data_file, sensor_traj, T_sensor_head, ret
         print(f"File saved in {synced_data_file}")
 
     return fp_data['pose'], fp_data['trans'], fp_data['mocap_trans']
+
+def draw_bbox_on_image(img, bbox):
+    x1, y1, x2, y2 = bbox
+    x1, y1, x2, y2 = round(x1), round(y1), round(x2), round(y2)
+    color = (0, 255, 0)  # 绿色
+    thickness = 2  # 线条粗细
+
+    img_with_bbox = img.copy()
+    cv2.rectangle(img_with_bbox, (x1, y1), (x2, y2), color, thickness)
+
+    cv2.imshow("BBox Image", img_with_bbox)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
 
 def make_sensor_params(sensor, gap_frame):
     info = f"{sensor['syncid'][gap_frame]} ({sensor['times'][sensor['syncid'][gap_frame]]}s) " if gap_frame>0 else gap_frame
@@ -267,6 +281,17 @@ def project_pts_img(img, points, linear_calib, T_world_device, size=3):
                                     size=size)[0] # rgb
     else:
         return img.copy()
+    
+def get_bbox_by_proj(points, linear_calib, T_world_device):
+    T_cam_world   = (T_world_device @ linear_calib.get_transform_device_camera()).inverse().to_matrix()
+    u, v, depth = project_point_cloud_to_image(points, linear_calib, T_cam_world)
+    if len(u) == 0 or len(v) == 0:
+        return None
+
+    x1, y1 = min(u), min(v)
+    x2, y2 = max(u), max(v)
+
+    return round(x1), round(y1), round(x2), round(y2)
 
 if __name__ == '__main__':
     parser = configargparse.ArgumentParser()
@@ -274,8 +299,6 @@ if __name__ == '__main__':
     parser.add_argument("--root_folder", type=str, 
                         default="/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd",
                         help="The data's root directory")
-
-    parser.add_argument("--traj_file", type=str, default='lidar_trajectory.txt')
 
     parser.add_argument("--params_file", type=str, default='dataset_params.json')
 
@@ -285,25 +308,14 @@ if __name__ == '__main__':
     parser.add_argument('-E', "--end_idx", type=int, default=np.inf,
                         help='The end frame index in LiDAR for processing, specified when sychronization time is too early.')
 
-    parser.add_argument("-VS", "--voxel_size", type=float, default=0.06, 
-                        help="The voxel filter parameter for TSDF fusion")
-
     parser.add_argument("--skip_frame", type=int, default=8, 
                         help='The everay n frame used for mapping')
     
-    parser.add_argument('--tsdf', action='store_true',
-                        help="Use VDB fusion to build the scene mesh")
-    
-    parser.add_argument('--sdf_trunc', type=float, default=0.25,
-                        help="The trunction distance for SDF funtion")
-
-    parser.add_argument('--sync', action='store_true', 
-                        help='Synced all data and save a pkl based on the params_file')
+    parser.add_argument('--vis_cam', action='store_true', help='Visualize human in the camera')
 
     args, opts  = parser.parse_known_args()
     root_folder = args.root_folder
     head_f      = glob(root_folder + '/*head')[0]
-    traj_file   = os.path.join(head_f, 'mps', 'slam', 'closed_loop_trajectory.csv')
     params_file = os.path.join(root_folder, args.params_file)
     if os.path.exists(params_file):
         dataset_params = read_json_file(params_file)
@@ -335,28 +347,26 @@ if __name__ == '__main__':
 
     aria_points = nd_lodaer.get_all_pointclouds()
     for tag, pc in aria_points.items():
-        save_path = os.path.join(root_folder, 'body', f'pc_{tag}.txt')
+        save_path = os.path.join(root_folder, 'synced_data', f'pc_{tag}.txt')
         np.savetxt(save_path, pc)
 
     # get head_traj based on the online_calibs times
-    head_traj = []
+    # head_traj = []
     global_poses = []
     for idx, t_s in enumerate(aria_trajs['recording_head'][:, -1]):
         calib = nd_lodaer.recording_head.mps_dp.get_online_calibration(int(t_s*1e9))
         ct = calib.tracking_timestamp.total_seconds()
         pose, _ = nd_lodaer.recording_head.get_pose(int(ct*1e9), TimeDomain.DEVICE_TIME)
-        q_xyzw = R.from_matrix(pose.transform_world_device.to_matrix()[:3, :3]).as_quat()
-        xyz = pose.transform_world_device.to_matrix()[:3, 3]
-        head_traj.append(np.hstack([idx, q_xyzw, xyz, ct]))
+        # q_xyzw = R.from_matrix(pose.transform_world_device.to_matrix()[:3, :3]).as_quat()
+        # xyz = pose.transform_world_device.to_matrix()[:3, 3]
+        # head_traj.append(np.hstack([idx, xyz, q_xyzw, ct]))
         global_poses.append(pose)
-
-    head_traj = np.array(head_traj)
 
     head_traj = aria_trajs['recording_head']
     head_pc = aria_points['recording_head']
         
     # aria_poses = nd_lodaer.get_synced_poses()
-    save_path = os.path.join(os.path.dirname(traj_file), 'head_trajectory.txt')
+    save_path = os.path.join(root_folder, 'synced_data', 'head_trajectory.txt')
     np.savetxt(save_path, head_traj)
     print(f"Aria glasses Head trajectory saved in {save_path}")
 
@@ -381,7 +391,7 @@ if __name__ == '__main__':
     
     # define T_head_aria
     T_head_aria = nd_lodaer.recording_head.vrs_dp.get_device_calibration().get_transform_cpf_sensor("camera-slam-left").to_matrix()
-    T_head_aria[:3, 3] = np.array([0.067, 0.091, 0.037])
+    T_head_aria[:3, 3] = np.array([0.055, 0.096, 0.076])    # neutral 
     T_sensor_head = np.linalg.inv(T_head_aria)  # transformation from head to aria
     print(f"Transformation from head to aria: \n{T_sensor_head}")
 
@@ -390,8 +400,65 @@ if __name__ == '__main__':
     # --------------------------------------------
     # 4. Synchronize the camera data
     # --------------------------------------------
-    vis_cam = False
-    if vis_cam:
+    if True:
+
+        with open(synced_data_file, "rb") as f:
+            save_data = pickle.load(f)
+        
+            fp_data = save_data['first_person']
+            first_pose, first_tran, trans2 = fp_data['pose'], fp_data['trans'], fp_data['mocap_trans']
+
+        calib_head = nd_lodaer.recording_head.vrs_dp.get_device_calibration().get_camera_calib("camera-rgb")
+        new_calib_head = calibration.get_linear_camera_calibration(
+            1024, 
+            1024, 
+            400, "camera-rgb",calib_head.get_transform_device_camera())
+        
+        vertices, j, _ = poses_to_vertices_torch(first_pose, first_tran, gender='neutral', is_cuda=True)                            
+        # bboxes = [[]] * len(vertices)
+        bboxes = {"full": [[]] * len(vertices),
+                  "leftHand": [[]] * len(vertices),
+                  "rightHand": [[]] * len(vertices),
+                  "left_arm": [[]] * len(vertices),
+                  "right_arm": [[]] * len(vertices)}
+        
+        if not os.path.exists(os.path.join(head_f, 'undistorted_imgs')):
+            os.mkdir(os.path.join(head_f, 'undistorted_imgs'))
+        for idx, t_s in tqdm(enumerate(device_time), total=len(device_time), desc="Processing"):
+            out_path = os.path.join(head_f, 'imgs',  f"{t_s:.6f}.jpg")
+            if not os.path.exists(out_path):
+                result = nd_lodaer.recording_head.get_rgb_image(int(t_s*1e9), TimeDomain.DEVICE_TIME)
+                if abs(result[-1] / 1e6) > 33:
+                    logger.warning(f"time difference for image query: {result[-1]/ 1e6} ms")
+                rgb_img = cv2.cvtColor(result[0].to_numpy_array(), cv2.COLOR_BGR2RGB)
+                undistorted_img = undistort_image(rgb_img, new_calib_head, calib_head, "rgb")
+                # save the undistorted image
+                cv2.imwrite(os.path.join(head_f, 'imgs',  f"{t_s:.6f}.jpg"), undistorted_img)
+                
+            bbox = get_bbox_by_proj(vertices[idx].cpu().numpy(), 
+                                    new_calib_head, 
+                                    global_poses[frameids[idx]].transform_world_device)
+            
+            if bbox is not None:
+                bboxes['full'][idx] = bbox
+                for parts in ['leftHand', 'rightHand', 'left_arm', 'right_arm']:
+                    bbox = get_bbox_by_proj(vertices[idx][BODY_PARTS[parts]].cpu().numpy(), 
+                                            new_calib_head, 
+                                            global_poses[frameids[idx]].transform_world_device)
+                    if bbox is not None:
+                        bboxes[parts][idx] = bbox
+
+
+        with open(synced_data_file, "wb") as f:
+            save_data['first_person']['bboxes'] = bboxes
+            w, h  = new_calib_head.get_image_size()
+            save_data['first_person']['cam_head'] = {'w': w, 
+                                                     'h': h}
+
+            pickle.dump(save_data, f)
+            print(f"Boxes saved in {synced_data_file}") 
+                                    
+    if args.vis_cam:
         calib_head   = nd_lodaer.recording_head.vrs_dp.get_device_calibration().get_camera_calib("camera-rgb")
         new_calib_head = calibration.get_linear_camera_calibration(
             512, 
@@ -410,8 +477,8 @@ if __name__ == '__main__':
         w, h  = new_calib_obs.get_image_size()
         video_writer = cv2.VideoWriter(os.path.join(head_f, "video.avi"), fourcc, fps, (w*2, h*2))
         
-        vertices, j, _ = poses_to_vertices_torch(first_pose, first_tran, is_cuda=True)
-        vertices2, j, _ = poses_to_vertices_torch(first_pose, trans2, is_cuda=True)
+        vertices, j, _ = poses_to_vertices_torch(first_pose, first_tran, gender='neutral', is_cuda=False)
+        vertices2, j, _ = poses_to_vertices_torch(first_pose, trans2, gender='neutral', is_cuda=False)
         for idx, t_s in tqdm(enumerate(device_time), total=len(device_time), desc="Processing"):
             result = nd_lodaer.recording_head.get_rgb_image(int(t_s*1e9), TimeDomain.DEVICE_TIME)
             if abs(result[-1] / 1e6) > 33:  # 33ms

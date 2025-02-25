@@ -69,7 +69,7 @@ def set_wandb(args):
 
     cfg = CfgNode.load_cfg(
         open(os.path.join(os.path.dirname(__file__), 'config.yaml')))
-    wandb.init(project='SLOPER4D', entity='climbingdaily', resume='allow',
+    wandb.init(project='EGOMOTION', entity='climbingdaily', resume='allow',
                group=os.path.basename(args.root_folder))
     wandb.run.name = f'{os.path.basename(args.root_folder)}-{args.name}-{wandb.run.id}'
 
