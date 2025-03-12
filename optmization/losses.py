@@ -24,8 +24,15 @@ import torch
 from torch.nn import functional as F
 
 from kaolin.metrics.trianglemesh import point_to_mesh_distance
+from kaolin.metrics.render import mask_iou
 from kaolin.ops.mesh import index_vertices_by_faces, face_normals
+from kaolin.render.mesh import rasterize, camera
 
+from pytorch3d.structures import Meshes
+from pytorch3d.renderer import (    
+    RasterizationSettings,    
+    MeshRasterizer,    
+    PerspectiveCameras,)
 
 sys.path.append(os.path.dirname(os.path.split(os.path.abspath( __file__))[0]))
 
@@ -71,7 +78,36 @@ def chamfer_distance_x2y(x, y):
 
     return min_distances[0], min_distances2[0]
 
-def iou_loss(points_coord, mask_coord, min_pixel_dist = 1):
+def iou_loss(mask: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
+    """
+    计算二值掩码 `mask` 和 `points` 之间的 IoU Loss (1 - IoU)
+    
+    :param mask: (H, W) 形状的 PyTorch 张量, 目标掩码（二值 0/1）
+    :param points: (N, 2) 形状的 PyTorch 张量, 预测点的坐标
+    :return: IoU Loss (标量)
+    """
+    h, w = mask.shape
+
+    # 生成预测点的二值掩码 (pred_mask)
+    pred_mask = torch.zeros_like(mask, dtype=torch.float32)
+    
+    # 设置 points 位置为 1
+    x, y = points[:, 0], points[:, 1]  # 提取 x 和 y 坐标
+    valid = (x >= 0) & (x < w) & (y >= 0) & (y < h)  # 过滤超出边界的点
+    pred_mask[y[valid], x[valid]] = 1  # 只更新有效点
+
+    # 计算 IoU
+    intersection = (mask * pred_mask).sum()
+    union = ((mask + pred_mask) > 0).sum()
+
+    # 避免除零错误
+    epsilon = 1e-6
+    iou = intersection / (union + epsilon)
+
+    # 计算 IoU Loss
+    return 1 - iou
+
+def iou_loss2(points_coord, mask_coord, min_pixel_dist = 1):
     """
     The function calculates the intersection over union (IOU) loss between two sets of points and masks.
     
@@ -96,30 +132,180 @@ def iou_loss(points_coord, mask_coord, min_pixel_dist = 1):
 
     iou_loss1 = non_inter_points / len(p2m)
     iou_loss2 = non_inter_mask / len(m2p)
-    iou_loss = (non_inter_mask + non_inter_points) / (non_inter_points + non_inter_mask + len(m2p))
-    return iou_loss1, iou_loss2, iou_loss
+    loss = (non_inter_mask + non_inter_points) / (non_inter_points + non_inter_mask + len(m2p))
+    return iou_loss1, iou_loss2, loss
 
-def cam_loss(mask, vertices, intrinsic, extrinsic):
+def camera_to_pixel(cam_in, X):
+    f = cam_in[:2]
+    c = cam_in[2:]
+    XX = X[..., :2] / (X[..., 2:])
+    return f * XX + c
+
+def filter_points(points, min_angle_deg=20, min_distance=0.2, max_distance=80):
+    """
+    Filter a 3D point cloud based on the angle between the points and the XY plane of the camera coordinate system,
+    as well as the minimum and maximum distance from the camera.
+
+    Args:
+    - points: a numpy array of shape (N, 3) containing the 3D points in camera coordinates to be filtered
+    - min_angle_deg: the minimum angle between a point and the XY plane of the camera coordinate system, in degrees
+    - min_distance: the minimum distance between a point and the camera origin, in meters
+    - max_distance: the maximum distance between a point and the camera origin, in meters
+
+    Returns:
+    - A filtered 3D point cloud as a numpy array of shape (N', 3)
+    """
+
+    # Calculate the distance and angle between each point and the XY plane
+    points = points[points[:, 2] > 0]
+    distance = torch.norm(points, dim=1)
+    xy_norm = torch.norm(points[:, :2], dim=1)
+    angle = torch.arccos(xy_norm / distance) * 180 / 3.141592653
+
+    # Filter points based on the angle, minimum distance, and maximum distance criteria
+    mask = (angle > min_angle_deg) & (distance > min_distance) & (distance < max_distance)
+    filtered_points = points[mask]
+
+    return filtered_points
+
+def opencv_extrinsic_to_lookat(R, t):
+    """将 OpenCV 的外参 (R, t) 转换为 CG 视角的 eye, at, up"""
+    eye = -R.T @ t  # 计算相机在世界坐标中的位置
+    at = eye + R.T @ torch.tensor([0, 0, -1])  # 计算相机看向的目标点
+    up = R.T @ torch.tensor([0, 1, 0])  # 计算相机的上方向
+    return eye.flatten(), at.flatten(), up.flatten()
+
+def intrinsics_to_fov(K, width, height):
+    """从 OpenCV 内参矩阵 K 计算水平和垂直 FOV"""
+    fx, fy = K[0, 0], K[1, 1]
+    fov_x = 2 * np.arctan(width / (2 * fx)) * 180 / np.pi  # 转换为度数
+    fov_y = 2 * np.arctan(height / (2 * fy)) * 180 / np.pi
+    return fov_x, fov_y
+
+def project_point_cloud_to_image(points, extrnsics, intrinsic, w=1024, h=1024):
+    R = extrnsics[:3, :3].astype(np.float32) # (3, 3)
+    T = extrnsics[:3, 3:].astype(np.float32) # (3,3)
+
+    camera_coordinates = R.dot(points.T) + T    # (3, n)
+
+    z = camera_coordinates[2, :]
+    valid_points = z > 0 
+
+    uv = intrinsic @ camera_coordinates[:, valid_points]
+    u, v = uv[0, :] / uv[2, :], uv[1, :] / uv[2, :]
+
+    valid_uv = (u > 0) & (u < w) & (v > 0) & (v < h)
+
+    return u[valid_uv], v[valid_uv], z[valid_points][valid_uv]
+
+def dice_loss(pred_maks, gt_maks, eps=1e-6):
+    """
+    The function calculates the dice loss between the predicted masks and the ground truth masks.
+    
+    Args:
+      pred_maks: A tensor of shape (B, H, W) representing the predicted masks.
+      gt_maks: A tensor of shape (B, H, W) representing the ground truth masks.
+      eps: A small constant to avoid division by zero. Defaults to 1e-6
+    
+    Returns:
+      A scalar representing the dice loss.
+    """
+    intersection = torch.sum(pred_maks * gt_maks, dim=(1, 2))
+    union = torch.sum(pred_maks, dim=(1, 2)) + torch.sum(gt_maks, dim=(1, 2))
+    dice_loss = 1 - (2 * intersection + eps) / (union + eps)
+    return torch.mean(dice_loss)
+
+def cam_loss(mask, vertices, faces, cameras:camera, bs=1, face_indices=None):
     """
     It calculates the camera loss based on the given mask, vertices, intrinsic, and extrinsic matrices.
     
     Args:
       mask (torch.Tensor): A binary mask indicating the valid vertices.
-      vertices (torch.Tensor): The 3D vertices of the mesh.
-      intrinsic (torch.Tensor): The intrinsic camera matrix.
-      extrinsic (torch.Tensor): The extrinsic camera matrix.
+      vertices (torch.Tensor): The 3D vertices of the mesh. (B, 6890, 3)
+      cameras: A kaolin camera object
     
     Returns:
       A scalar representing the camera loss.
     """
     # project vertices to image plane
-    cam_vertices = intrinsic @ extrinsic @ vertices.unsqueeze(1)
-    cam_vertices = cam_vertices[:, :, :2] / cam_vertices[:, :, 2:]
+    sum_loss = []
+    loss_dict = []
     
-    # calculate loss
-    # mask = mask.unsqueeze(2).expand(-1, -1, 2)
-    loss = iou_loss(cam_vertices, mask.unsqueeze(0))
-    return loss
+    mesh = Meshes(verts=[v for v in vertices], faces=[faces] * len(vertices))
+    raster_settings = RasterizationSettings(image_size=1024,   # Resolution    
+                                            blur_radius=0.0,  # No anti-aliasing    
+                                            faces_per_pixel=1 # Number of faces to store)
+    )
+    for idx in range(0, len(vertices)):
+        rasterizer = MeshRasterizer(cameras=cameras[idx],    
+                                    raster_settings=raster_settings)
+
+        fragments = rasterizer(mesh[idx])
+        # valid_mask = fragments.pix_to_face[..., 0] >= 0
+        valid_zbuf = torch.clamp(fragments.zbuf[..., 0], 0, 1)
+        valid_zbuf[valid_zbuf > 0] = torch.sigmoid(5 + valid_zbuf[valid_zbuf>0])
+        mm = mask[0][:1] + mask[0][1:]
+        if (mm.sum() > 1000):
+            loss = dice_loss(valid_zbuf, mm)
+            sum_loss.append(loss)
+            loss_dict.append(idx)
+    # Kaolin cameras
+    # vertices_camera = cameras[1].extrinsics.transform(vertices)
+    # vertices_image = cameras[1].intrinsics.transform(vertices_camera)
+    # face_vertices_camera = index_vertices_by_faces(vertices_camera, faces)[:, face_indices]
+    # face_vertices_image = index_vertices_by_faces(vertices_image, faces)[..., :2][:, face_indices]
+    # in_face_features = torch.ones(tuple([len(vertices)] + list(faces[face_indices].shape) + [1]), dtype=cameras.dtype, device=cameras.device)
+    # valid_faces = (face_vertices_camera[:, :, :, 2] < 0).all(dim=-1)  # Shape: (B, n)
+
+    # for idx in range(len(mask)):
+    #     _, face_idx = rasterize(
+    #         cameras.height, cameras.width,
+    #         face_features=in_face_features[idx:idx+1],
+    #         face_vertices_z=face_vertices_camera[..., -1][idx:idx+1],  # can be face_vertices_image[..., -1] instead?
+    #         face_vertices_image=face_vertices_image[idx:idx+1],
+    #         valid_faces=valid_faces[idx:idx+1],)
+    
+    #     loss = mask_iou((face_idx>=0).float(), mask[0][:1] + mask[0][1:])
+    #     sum_loss.append(loss)
+    #     loss_dict.append(idx)
+    
+    return [sum_loss, loss_dict]
+
+def show_image_with_uv(u, v, w=1024, h=1024):
+    """
+    Displays an image with a marker at the given (u, v) location.
+    
+    :param image: The image to display (numpy array)
+    :param u: Normalized x-coordinate (0 to 1)
+    :param v: Normalized y-coordinate (0 to 1)
+    :param w: Image width
+    :param h: Image height
+    """
+    import cv2
+    # Convert normalized coordinates to pixel coordinates
+    
+    # Make a copy of the image to draw on
+    img_copy = np.zeros((w, h, 3), dtype=np.uint8)
+    
+    for x, y in zip(u, v):
+        x = int(x * w)
+        y = int(y * h)
+        # Draw a circle at (x, y)
+        cv2.circle(img_copy, (x, y), radius=1, color=(0, 0, 255), thickness=-1)
+    
+    # Show the image
+    cv2.imshow("Image", img_copy)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+def opencv_to_opengl_viewmatrix(ex):
+    M_flip = torch.tensor([[
+        [1., 0, 0, 0],
+        [0, -1, 0, 0],   
+        [0, 0, -1, 0],
+        [0, 0, 0, 1]
+    ]], device=ex.device)
+    return M_flip @ ex
 
 def load_vertices():
     global CONTACT_VERTS

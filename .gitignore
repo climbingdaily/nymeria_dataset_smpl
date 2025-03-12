@@ -10,3 +10,5 @@ tmp/
 /checkpoints
 *.mp4
 *.h5
+
+wandb/

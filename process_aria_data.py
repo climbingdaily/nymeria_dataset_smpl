@@ -32,7 +32,6 @@ from smpl import BODY_PARTS
 field_fmts = ['%d', '%.6f', '%.6f', '%.6f', '%.6f', '%.6f', '%.6f', '%.6f', '%.3f']
 
 def save_trajs(save_dir, rot, pos, mocap_id, comments='first', framerate=100):
-    # lidar_file = os.path.join(save_dir, 'lidar_traj.txt')
     save_file = os.path.join(save_dir, f'{comments}_person_traj.txt')
     imu_to_world = np.array([[-1,0,0],[0,0,1],[0,1,0]])
     # xsense_to_world = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]]) 
@@ -282,9 +281,8 @@ def project_pts_img(img, points, linear_calib, T_world_device, size=3):
     else:
         return img.copy()
     
-def get_bbox_by_proj(points, linear_calib, T_world_device):
-    T_cam_world   = (T_world_device @ linear_calib.get_transform_device_camera()).inverse().to_matrix()
-    u, v, depth = project_point_cloud_to_image(points, linear_calib, T_cam_world)
+def get_bbox_by_proj(points, linear_calib, T_cam_world):
+    u, v, _ = project_point_cloud_to_image(points, linear_calib, T_cam_world)
     if len(u) == 0 or len(v) == 0:
         return None
 
@@ -350,9 +348,11 @@ if __name__ == '__main__':
         save_path = os.path.join(root_folder, 'synced_data', f'pc_{tag}.txt')
         np.savetxt(save_path, pc)
 
-    # get head_traj based on the online_calibs times
-    # head_traj = []
-    global_poses = []
+    # get camera_traj based on the online_calibs times
+    T_c_w = []
+    calib_head = nd_lodaer.recording_head.vrs_dp.get_device_calibration().get_camera_calib("camera-rgb")
+    calib_head.get_transform_device_camera()
+
     for idx, t_s in enumerate(aria_trajs['recording_head'][:, -1]):
         calib = nd_lodaer.recording_head.mps_dp.get_online_calibration(int(t_s*1e9))
         ct = calib.tracking_timestamp.total_seconds()
@@ -360,7 +360,7 @@ if __name__ == '__main__':
         # q_xyzw = R.from_matrix(pose.transform_world_device.to_matrix()[:3, :3]).as_quat()
         # xyz = pose.transform_world_device.to_matrix()[:3, 3]
         # head_traj.append(np.hstack([idx, xyz, q_xyzw, ct]))
-        global_poses.append(pose)
+        T_c_w.append((pose.transform_world_device @ calib_head.get_transform_device_camera()).inverse().to_matrix())
 
     head_traj = aria_trajs['recording_head']
     head_pc = aria_points['recording_head']
@@ -401,14 +401,12 @@ if __name__ == '__main__':
     # 4. Synchronize the camera data
     # --------------------------------------------
     if True:
-
         with open(synced_data_file, "rb") as f:
             save_data = pickle.load(f)
         
             fp_data = save_data['first_person']
             first_pose, first_tran, trans2 = fp_data['pose'], fp_data['trans'], fp_data['mocap_trans']
 
-        calib_head = nd_lodaer.recording_head.vrs_dp.get_device_calibration().get_camera_calib("camera-rgb")
         new_calib_head = calibration.get_linear_camera_calibration(
             1024, 
             1024, 
@@ -437,14 +435,14 @@ if __name__ == '__main__':
                 
             bbox = get_bbox_by_proj(vertices[idx].cpu().numpy(), 
                                     new_calib_head, 
-                                    global_poses[frameids[idx]].transform_world_device)
+                                    T_c_w[frameids[idx]])
             
             if bbox is not None:
                 bboxes['full'][idx] = bbox
                 for parts in ['leftHand', 'rightHand', 'left_arm', 'right_arm']:
                     bbox = get_bbox_by_proj(vertices[idx][BODY_PARTS[parts]].cpu().numpy(), 
                                             new_calib_head, 
-                                            global_poses[frameids[idx]].transform_world_device)
+                                            T_c_w[frameids[idx]])
                     if bbox is not None:
                         bboxes[parts][idx] = bbox
 
@@ -453,13 +451,14 @@ if __name__ == '__main__':
             save_data['first_person']['bboxes'] = bboxes
             w, h  = new_calib_head.get_image_size()
             save_data['first_person']['cam_head'] = {'w': w, 
-                                                     'h': h}
+                                                     'h': h,
+                                                     'intrinsic': new_calib_head.projection_params().tolist(),
+                                                     'extrinsic': np.stack(T_c_w)[frameids].tolist()}
 
             pickle.dump(save_data, f)
             print(f"Boxes saved in {synced_data_file}") 
                                     
     if args.vis_cam:
-        calib_head   = nd_lodaer.recording_head.vrs_dp.get_device_calibration().get_camera_calib("camera-rgb")
         new_calib_head = calibration.get_linear_camera_calibration(
             512, 
             512, 
@@ -485,11 +484,10 @@ if __name__ == '__main__':
                 logger.warning(f"time difference for image query: {result[-1]/ 1e6} ms")
             rgb_img = cv2.cvtColor(result[0].to_numpy_array(), cv2.COLOR_BGR2RGB)
             undistorted_img  = undistort_image(rgb_img, new_calib_head, calib_head, "rgb")
-            img = project_pts_img(undistorted_img, vertices[idx].cpu().numpy(), new_calib_head, global_poses[frameids[idx]].transform_world_device)
-            img2 = project_pts_img(undistorted_img, vertices2[idx].cpu().numpy(), new_calib_head, global_poses[frameids[idx]].transform_world_device, size=5)
+            img = project_pts_img(undistorted_img, vertices[idx].cpu().numpy(), new_calib_head, T_c_w[frameids[idx]])
+            img2 = project_pts_img(undistorted_img, vertices2[idx].cpu().numpy(), new_calib_head, T_c_w[frameids[idx]], size=5)
 
             tc = nd_lodaer.recording_head.vrs_dp.convert_from_device_time_to_timecode_ns(int(t_s*1e9))
-
             pose, _ = nd_lodaer.recording_observer.get_pose(tc, TimeDomain.TIME_CODE)
             result = nd_lodaer.recording_observer.get_rgb_image(tc, TimeDomain.TIME_CODE)
             if abs(result[-1] / 1e6) > 33:  # 33ms
