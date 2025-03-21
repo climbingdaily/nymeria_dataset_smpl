@@ -12,3 +12,4 @@ tmp/
 *.h5
 
 wandb/
+*.npz

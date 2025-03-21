@@ -27,6 +27,20 @@ sys.path.append('..')
 
 from smpl import SMPL_Layer
 from utils import poses_to_vertices_torch
+from 3rdParties.human_body_prior.body_model.body_model import BodyModel
+
+def load_body_models(gender = 'neutral', support_dir='support_data/', num_betas=16, num_dmpls=8):
+    # Load SMPL body models (here we load
+    # @support_dir, path to the body model directory
+    # @num_betas, body shape parameters
+    # @num_dmpls, DMPL parameters
+    bm_fname   = os.path.join(support_dir, f'body_models/smplh/{gender}/model.npz')
+    dmpl_fname = os.path.join(support_dir, f'body_models/dmpls/{gender}/model.npz')
+
+    bm   = BodyModel(bm_fname=bm_fname, num_betas=num_betas, num_dmpls=num_dmpls, dmpl_fname=dmpl_fname)#.to(comp_device)
+
+    return bm
+
 def sam2_tracking_function(prompts:dict, predictor, inference_state, mask_dict:dict, img_list):
     # lefthand_id = 1
     # righthand_id = 2
@@ -151,7 +165,7 @@ class SmplParams:
                 f"betas={betas.tolist()}, gender='{self.gender}')")
 
 class ImageAnnotator:
-    def __init__(self, img_folder, sam2_function, start, end):
+    def __init__(self, img_folder, sam2_function, pkl_file, start, end):
         self.sam2_function = sam2_function  
 
         self.rotate_image = True
@@ -166,8 +180,6 @@ class ImageAnnotator:
         mask_file = os.path.join(os.path.dirname(self.img_folder), 
                                  f"mask_{os.path.basename(self.img_folder)}.pkl")
         
-        pkl_file = '/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd/log/2025-03-18T18:23:41_.pkl'
-
         if os.path.exists(pkl_file):
             with open(pkl_file, 'rb') as f:
                 synced_data = pickle.load(f)
@@ -466,7 +478,7 @@ class ImageAnnotator:
 # 用法示例
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    # parser.add_argument("--pkl_path", type=str, default='/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd/synced_data/humans_param.pkl', help="Path to the pkl file")
+    parser.add_argument("--pkl_path", type=str, default='/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd/log/2025-03-18T18:23:41_.pkl', help="Path to the pkl file")
     parser.add_argument("--img_folder", type=str, default='/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd/recording_head/imgs', help="Path to the image folder")
 
     parser.add_argument("-S", "--start", type=int, default=1049,
@@ -480,5 +492,5 @@ if __name__ == "__main__":
     start = args.start
     end = args.end
     
-    annotator = ImageAnnotator(img_folder, sam2_tracking_function, start, end)
+    annotator = ImageAnnotator(img_folder, sam2_tracking_function, args.pkl_path, start, end)
     annotator.run()
