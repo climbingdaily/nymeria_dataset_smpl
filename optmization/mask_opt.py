@@ -603,181 +603,10 @@ class Optimizer():
         def add_loss_item(ll, weight, category, is_concat=False):
             return get_weight_loss(ll, weight, category, print_str, loss_dict, indexes, loss_chart, is_concat)
 
-        if iters % 10 == 0 and iters < self.stage['all_loss']:
-            self.contact_info = get_contacinfo(foot_states, jump_list, scene_grids, smpl_verts)
-
         # =============  0. re-projecting term =====================
-        if self.w['mask_loss'] > 0 and iters >= self.stage['pose']:
+        if self.w['mask_loss'] > 0:
             ll = cam_loss(opt_params['mask'], smpl_verts, self.smpl_layer.th_faces, cameras=opt_params['cameras'], face_indices=self.valid_face)
             sum_loss += add_loss_item(ll, self.w['mask_loss'], 'mask')
-
-        # =============  1. scene-aware terms =====================
-        # foot contact loss
-        if self.w['ft_cont'] >= 0 and iters >= self.stage['start'] and iters < self.stage['proj_only']:
-            ll   = contact_constraint(smpl_verts, self.contact_info, self.shoes_height)
-            loss = add_loss_item(ll, self.w['ft_cont'], 'cont')
-            sum_loss += loss
-
-        # body-scene collision loss
-        if self.w['coll'] >= 0 and iters >= self.stage['start'] and iters < self.stage['proj_only']:
-            sum_loss += add_loss_item(foot_collision(smpl_verts,
-                                      self.contact_info), 
-                                      self.w['coll'], 'coll')
-        # =============  2. scene-aware terms =====================
-                
-        # sensor_center_to_head CD loss
-        if self.w['l2h'] >= 0 and self.person == 'first_person' and iters < self.stage['proj_only']:
-            ll = (opt_params['sensor_traj'] @ self.head2sensor)[:, :3, 3] - joints[:, 15]
-            loss = torch.abs(ll).sum(-1)
-            loss = add_loss_item([torch.abs(ll).sum(-1), 
-                                  np.arange(end - start).tolist()], 
-                                  self.w['l2h'], 'sensor')
-
-            if self.w['l2h'] > 0:
-                sum_loss += loss
-
-        # =============  3. self-constraint loss =====================
-        # self penetration loss
-        # if self.w['pen_loss'] >= 0 and iters >= self.stage['pose']:
-        #     loss = add_loss_item(collision_loss(smpl_verts, 
-        #                                         self.smpl_layer.th_faces),
-        #                          self.w['pen_loss'], 'pen')
-
-        #     if iters >= self.stage['pose'] and self.w['pen_loss'] > 0:
-        #         sum_loss += loss
-
-        # pose prior (from IMU) loss
-        if self.w['pose_prior'] >= 0 and iters >= self.stage['pose'] and iters < self.stage['proj_only']:
-            loss   = torch.sum(torch.abs(opt_params['pose'] - convert_to_6D_rot(
-                init_params['pose'][start:end].view(-1, 3))).view(-1, 23, 6), dim=-1)
-            
-            # loss = torch.mean(loss, dim=-1)
-            loss   = (loss @ torch.from_numpy(BODY_PRIOR_WEIGHT[1:]).to(loss.device)) / 23
-
-            weight = 1 if 'first' in self.person else 0.97 ** (iters - self.stage['pose'])
-            loss   = add_loss_item(
-                [loss, np.arange(end - start).tolist()], self.w['pose_prior'] * weight, 'prior')
-
-            if loss and self.w['pose_prior'] > 0:
-                sum_loss += loss
-
-        # foot sliding loss
-        if self.w['ft_sld'] >= 0 and iters < self.stage['proj_only']:
-            ll = sliding_constraint(smpl_verts, 
-                                    foot_states, 
-                                    jump_list, lfoot_move, rfoot_move)
-            loss = add_loss_item(ll, self.w['ft_sld'], 'sld')
-
-            if iters > self.stage['cont'] and self.w['ft_sld'] > 0:
-                sum_loss += loss
-        # =============  self-constraint loss =====================
-
-        # =============  4. temporal smoothness loss =====================
-        # translation smooth loss
-        if self.w['trans_smth'] >= 0 and iters < self.stage['proj_only']:
-            loss = trans_imu_smooth(
-                opt_params['trans'].squeeze(1),
-                jump_list,
-                self.imu_smt_mode,
-                0.02/self.sensor_frame_rate)
-
-            loss = add_loss_item(loss, self.w['trans_smth'], 'trans')
-
-            if iters > self.stage['cont'] and self.w['trans_smth'] > 0:
-                sum_loss += loss
-
-        #  body joints trans smoothness
-        if self.w['jts_smth'] >= 0 and iters >= self.stage['ort'] and iters < self.stage['proj_only']:
-            loss = joints_smooth(joints, self.imu_smt_mode, BODY_WEIGHT[1:])
-            loss = add_loss_item(
-                [loss, np.arange(2, end - start).tolist()], self.w['jts_smth'], 'jts')
-            sum_loss += loss
-
-        # global rotation smoothness
-        if self.w['rot_smth'] >= 0 and iters >= self.stage['ort'] and iters < self.stage['proj_only']:
-            # loss = joint_orient_error(ori_params[1:], ori_params[:-1])
-            loss = torch.mean(
-                torch.abs(opt_params['ori'][0:-1] - opt_params['ori'][1:]), dim=-1)
-            loss = add_loss_item(
-                [loss, np.arange(1, end - start).tolist()], self.w['rot_smth'], 'rot')
-
-            if iters >= self.stage['ort'] and self.w['rot_smth'] > 0:
-                sum_loss += loss
-
-        # body pose rotation smoothness
-        if self.w['rot_smth'] >= 0 and iters >= self.stage['ort'] and iters < self.stage['proj_only']:
-            # loss = joint_orient_error(ori_params[1:], ori_params[:-1])
-            loss = torch.abs(opt_params['pose'].view(-1, 23, 6)
-                             [0:-1]-opt_params['pose'].view(-1, 23, 6)[1:]).sum(-1).mean(-1)
-            loss = add_loss_item(
-                [loss, np.arange(1, end - start).tolist()], self.w['rot_smth'], 'pose')
-
-            if iters > self.stage['cont'] and self.w['rot_smth'] > 0:
-                sum_loss += loss
-        # =============  temporal smoothness loss =====================
-
-        # concancatation loss between two optmization segments
-        if sub_seg > 0:
-            # concancatation translation loss
-            if self.w['cat_trans'] >= 0 and iters < self.stage['proj_only']:
-                acc = opt_params['trans'][0] - 2 * \
-                    self.pre_sensor_t[1] + self.pre_sensor_t[0]
-                loss1 = torch.nn.functional.relu(torch.norm(acc) - 1e-4)
-                acc = opt_params['trans'][1] - 2 * opt_params['trans'][0] + self.pre_sensor_t[1]
-                loss2 = torch.nn.functional.relu(torch.norm(acc) - 1e-4)
-                # trans = sensor_t[0] - self.pre_sensor_t[1]
-                # loss = torch.nn.functional.relu(torch.norm(trans) - 1e-4)
-                loss = add_loss_item(
-                    [[loss1, loss2], [0, 1]], self.w['cat_trans'], 'trans', True)
-
-                if loss and iters > self.stage['cont']:
-                    sum_loss += loss
-
-            # concancatation sliding loss
-            if self.w['cat_sld'] >= 0 and iters < self.stage['proj_only']:
-                init_verts = torch.cat((self.pre_verts[-1:], smpl_verts[0:1]))
-
-                loss, _ = sliding_constraint(
-                    init_verts,
-                    self.foot_states[start - 1:start + 1],
-                    jump_list,
-                    self.lfoot_move[start - 1: start + 1],
-                    self.rfoot_move[start-1:start+1])
-
-                loss = add_loss_item(
-                    [loss, [0]], self.w['cat_sld'], 'sld', True)
-
-                if loss and iters > self.stage['cont']:
-                    sum_loss += loss
-
-            # concancatation rotation smoothness loss
-            if self.w['cat_rot'] >= 0 and iters >= self.stage['ort'] and iters < self.stage['proj_only']:
-                loss = torch.mean(
-                    torch.abs(opt_params['ori'][:1] - self.pre_ori[-1:]), dim=-1)
-                loss = add_loss_item(
-                    [loss, [0]], self.w['cat_rot'], 'rot', True)
-                if loss and iters > self.stage['cont']:
-                    sum_loss += loss
-
-            # concancatation pose smoothness loss
-            if self.w['cat_pose'] >= 0 and iters >= self.stage['ort'] and iters < self.stage['proj_only']:
-                loss = torch.abs(
-                    opt_params['pose'][:1*23] - self.pre_pose[-1*23:]).sum(-1).mean()
-                loss = add_loss_item(
-                    [[loss], [0]], self.w['cat_pose'], 'pose', True)
-
-                if loss and iters > self.stage['cont']:
-                    sum_loss += loss
-
-            # concancatation joints smoothness loss
-            if self.w['cat_jts'] >= 0 and iters >= self.stage['ort'] and iters < self.stage['proj_only']:
-                loss = joints_smooth(torch.cat(
-                    [joints[:2], self.pre_joints[-2:]], dim=0), self.imu_smt_mode, BODY_WEIGHT[1:])
-                loss = add_loss_item(
-                    [loss, [0, 1]], self.w['cat_jts'], 'jts', True)
-
-                if iters > self.stage['cont'] and self.w['cat_jts'] > 0:
-                    sum_loss += loss
 
         return sum_loss, ''.join(print_str), loss_chart
 
@@ -823,34 +652,17 @@ class Optimizer():
             time_start = time.time()
 
             while True:
-                if iters == 0:  # Optimize global translation
-                    optimizer = get_optmizer('trans', 
-                                             [opt_params['trans']], 
-                                             self.learn_rate)
-                    
-                elif iters == self.stage['ort']: # Now optimize global orientation
-                    optimizer = get_optmizer('trans / orit',
-                                             [opt_params['trans'], 
-                                              opt_params['ori']],
-                                             self.learn_rate)
-
-                elif iters == self.stage['pose']: # Now optimize full SMPL pose
-                    optimizer = get_optmizer('trans / orit / pose',
-                                             [opt_params['trans'], 
-                                              opt_params['ori'], 
-                                              opt_params['pose']],
-                                             self.learn_rate)
-
-                elif iters == self.stage['all_loss']: # Now optimize the pose with all losses
-                    optimizer = get_optmizer('trans / orit / pose  with all loss functions', 
-                                             [opt_params['trans'], 
-                                              opt_params['ori'], 
-                                              opt_params['pose']], 
-                                             self.learn_rate)
-                elif iters == self.stage['proj_only']: # Now optimize the pose with all losses
+                if iters == 0:
                     optimizer = get_optmizer('pose only, for reprojection term only', 
-                                            [opt_params['pose']], 
+                                            [
+                                             opt_params['pose']], 
                                             self.learn_rate)
+                # elif iters == self.stage['proj_only']: # Now optimize the pose with all losses
+                #     optimizer = get_optmizer('trans / orit / pose  with all loss functions', 
+                #                              [opt_params['trans'], 
+                #                               opt_params['ori'], 
+                #                               opt_params['pose']], 
+                #                               self.learn_rate)
                 
                 sum_loss, info, loss_chart = self.get_losses(
                     scene_grids,
@@ -952,12 +764,12 @@ def config_parser(is_optimization=False):
         parser.add_argument("--radius",              type=float, default=0.6)
         parser.add_argument("--shoes_height",        type=float, default=0.00)
         parser.add_argument("-PS", "--plane_thresh", type=float, default=0.01)
-        parser.add_argument("--window_frames",       type=int, default=500,
+        parser.add_argument("--window_frames",       type=int, default=1,
                             help="window of the frame to be used")
 
         # Optimization parameters - global
-        parser.add_argument("--iterations",     type=int,   default=350)
-        parser.add_argument("--learn_rate",     type=float, default=0.005)
+        parser.add_argument("--iterations",     type=int,   default=250)
+        parser.add_argument("--learn_rate",     type=float, default=0.0001)
 
         parser.add_argument("--wt_ft_sliding",  type=float, default=400)
         parser.add_argument("--wt_ft_cont",     type=float, default=400)
@@ -1001,10 +813,12 @@ if __name__ == '__main__':
     parser.add_argument('--sensor_pos', type=str, default='Head', 
                         help="the sensor to the nearest body position to the SMPL Model")
 
-    parser.add_argument('--opt_file', type=str, default=None, 
+    parser.add_argument('--opt_file', type=str, default=None,
+                        # default='/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd/log/2025-03-18T17:52:07__wandb.pkl', 
                         help="the path of the optimization pkl file")
 
-    parser.add_argument('--logger_file', type=str, default=None, 
+    parser.add_argument('--logger_file', type=str, default=None,
+                        # default='/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd/log/2025-03-18T17:52:07__wandb.log', 
                         help="the path of optimization logger file")
 
     parser.add_argument('--name', type=str, default='',
@@ -1047,6 +861,6 @@ if __name__ == '__main__':
         logger_file = os.path.join(args.root_folder, 'log', args.logger_file)
 
         print('====== Run second person optimization ======')
-        optimizer = Optimizer(person='second_person')
+        optimizer = Optimizer(person='first_person')
         opt_file, _ = optimizer.set_args(args, opt_file, logger_file)
         optimizer.run(opt_file)

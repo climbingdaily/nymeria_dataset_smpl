@@ -32,12 +32,19 @@ from pytorch3d.structures import Meshes
 from pytorch3d.renderer import (    
     RasterizationSettings,    
     MeshRasterizer,    
+    MeshRenderer,
+    SoftSilhouetteShader,
+    SoftGouraudShader,
+    HardFlatShader,
+    MeshRendererWithFragments,
     PerspectiveCameras,)
 
 sys.path.append(os.path.dirname(os.path.split(os.path.abspath( __file__))[0]))
 
 import ChamferDistancePytorch.chamfer3D.dist_chamfer_3D as cham
+import ChamferDistancePytorch.chamfer2D.dist_chamfer_2D as cham2D
 distChamfer = cham.chamfer_3DDist()
+cham2d = cham2D.chamfer_2DDist()
 
 from utils import read_json_file
 from smpl import axis_angle_to_rotation_matrix, rotation_matrix_to_axis_angle, BODY_PARTS as BP
@@ -78,41 +85,16 @@ def chamfer_distance_x2y(x, y):
 
     return min_distances[0], min_distances2[0]
 
-def iou_loss(mask: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
-    """
-    计算二值掩码 `mask` 和 `points` 之间的 IoU Loss (1 - IoU)
-    
-    :param mask: (H, W) 形状的 PyTorch 张量, 目标掩码（二值 0/1）
-    :param points: (N, 2) 形状的 PyTorch 张量, 预测点的坐标
-    :return: IoU Loss (标量)
-    """
-    h, w = mask.shape
+def loss_filter(loss, a=50):
+    loss = 1 - 1 / (a * loss + 1) 
+    return loss
 
-    # 生成预测点的二值掩码 (pred_mask)
-    pred_mask = torch.zeros_like(mask, dtype=torch.float32)
-    
-    # 设置 points 位置为 1
-    x, y = points[:, 0], points[:, 1]  # 提取 x 和 y 坐标
-    valid = (x >= 0) & (x < w) & (y >= 0) & (y < h)  # 过滤超出边界的点
-    pred_mask[y[valid], x[valid]] = 1  # 只更新有效点
-
-    # 计算 IoU
-    intersection = (mask * pred_mask).sum()
-    union = ((mask + pred_mask) > 0).sum()
-
-    # 避免除零错误
-    epsilon = 1e-6
-    iou = intersection / (union + epsilon)
-
-    # 计算 IoU Loss
-    return 1 - iou
-
-def iou_loss2(points_coord, mask_coord, min_pixel_dist = 1):
+def iou_loss(points_coord, mask_coord, min_pixel_dist = 1):
     """
     The function calculates the intersection over union (IOU) loss between two sets of points and masks.
     
     Args:
-      points_coord: A tensor containing the coordinates of points in the predicted mask.
+      points_coord: A tensor containing the coordinates of points in the predicted mask. size must be (1, n1, 2)
       mask_coord: The coordinates of the mask, which is typically a binary image indicating the region
     of interest.
       min_pixel_dist: The minimum distance (in pixels) between a point and a mask for them to be
@@ -122,17 +104,16 @@ def iou_loss2(points_coord, mask_coord, min_pixel_dist = 1):
     Returns:
       two values: iou_loss1 and iou_loss2.
     """
-    # chamLoss = cham.chamfer_2DDist()
-    # dist1, dist2, idx1, idx2 = chamLoss(points_coord, mask_coord)
+    p2m, m2p, idx1, idx2 = cham2d(points_coord, mask_coord)
 
-    p2m, m2p = chamfer_distance_x2y(points_coord, mask_coord)
+    # p2m, m2p = chamfer_distance_x2y(points_coord, mask_coord)
 
     non_inter_points = loss_filter(torch.relu(p2m - (min_pixel_dist ** 2 + 1e-4))).sum()
-    non_inter_mask = loss_filter(torch.relu(m2p - (5 ** 2 + 1e-4))).sum()
+    non_inter_mask = loss_filter(torch.relu(m2p - (2 ** 2 + 1e-4))).sum()
 
-    iou_loss1 = non_inter_points / len(p2m)
-    iou_loss2 = non_inter_mask / len(m2p)
-    loss = (non_inter_mask + non_inter_points) / (non_inter_points + non_inter_mask + len(m2p))
+    iou_loss1 = non_inter_points / len(p2m[0])
+    iou_loss2 = non_inter_mask / len(m2p[0])
+    loss = (non_inter_mask + non_inter_points) / (non_inter_points + len(m2p[0]))
     return iou_loss1, iou_loss2, loss
 
 def camera_to_pixel(cam_in, X):
@@ -215,7 +196,7 @@ def dice_loss(pred_maks, gt_maks, eps=1e-6):
     dice_loss = 1 - (2 * intersection + eps) / (union + eps)
     return torch.mean(dice_loss)
 
-def cam_loss(mask, vertices, faces, cameras:camera, bs=1, face_indices=None):
+def cam_loss(mask, vertices, faces, cameras:camera, bs=1, face_indices=None, sclae=0.25):
     """
     It calculates the camera loss based on the given mask, vertices, intrinsic, and extrinsic matrices.
     
@@ -232,23 +213,37 @@ def cam_loss(mask, vertices, faces, cameras:camera, bs=1, face_indices=None):
     loss_dict = []
     
     mesh = Meshes(verts=[v for v in vertices], faces=[faces] * len(vertices))
-    raster_settings = RasterizationSettings(image_size=1024,   # Resolution    
-                                            blur_radius=0.0,  # No anti-aliasing    
-                                            faces_per_pixel=1 # Number of faces to store)
-    )
-    for idx in range(0, len(vertices)):
-        rasterizer = MeshRasterizer(cameras=cameras[idx],    
-                                    raster_settings=raster_settings)
 
-        fragments = rasterizer(mesh[idx])
-        # valid_mask = fragments.pix_to_face[..., 0] >= 0
-        valid_zbuf = torch.clamp(fragments.zbuf[..., 0], 0, 1)
-        valid_zbuf[valid_zbuf > 0] = torch.sigmoid(5 + valid_zbuf[valid_zbuf>0])
-        mm = mask[0][:1] + mask[0][1:]
-        if (mm.sum() > 1000):
-            loss = dice_loss(valid_zbuf, mm)
-            sum_loss.append(loss)
+    raster_settings = RasterizationSettings(image_size=512,   # Resolution    
+                                            blur_radius=0.0,  # No anti-aliasing    
+                                            faces_per_pixel=1, # Number of faces to store)
+                                            cull_backfaces=True,
+                                            perspective_correct=False,
+                                            bin_size=0,
+                                            z_clip_value=0.1)
+
+    rasterizer = MeshRasterizer(cameras=cameras,    
+                                raster_settings=raster_settings)
+    sil_renderer = MeshRenderer(rasterizer=rasterizer, 
+                                shader=SoftSilhouetteShader())
+    soft_mask = sil_renderer(mesh)[..., 3] # (B,H, W, 4)
+
+    for idx, sf in enumerate(soft_mask):    
+        if (mask[idx].sum() > 1000):
+            sum_loss.append(mask_iou(sf.unsqueeze(0), mask[idx:idx+1].sum(dim=1)))
             loss_dict.append(idx)
+        # fragments = rasterizer(mesh[idx])
+        # faces_idx = fragments.pix_to_face[..., 0] # (1, h, w)
+        # valid_mask = faces_idx >= 0               # (1, h, w)
+
+        # verts_idx = faces[faces_idx[valid_mask]]  # (n, 3)
+        # verts_selected = verts[verts_idx] # (n, 3, 3)
+        # bary_coords = fragments.bary_coords[valid_mask][..., 0, :]  # (n, 3)
+
+        # P3d = (bary_coords[..., None] * verts_selected).sum(dim=-2)  # (n, 3)
+        # P2d = cameras[idx].transform_points_screen(P3d)[:, :2]
+
+
     # Kaolin cameras
     # vertices_camera = cameras[1].extrinsics.transform(vertices)
     # vertices_image = cameras[1].intrinsics.transform(vertices_camera)
@@ -270,6 +265,7 @@ def cam_loss(mask, vertices, faces, cameras:camera, bs=1, face_indices=None):
     #     loss_dict.append(idx)
     
     return [sum_loss, loss_dict]
+
 
 def show_image_with_uv(u, v, w=1024, h=1024):
     """
@@ -295,8 +291,8 @@ def show_image_with_uv(u, v, w=1024, h=1024):
     
     # Show the image
     cv2.imshow("Image", img_copy)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+    # cv2.waitKey(0)
+    # cv2.destroyAllWindows()
 
 def opencv_to_opengl_viewmatrix(ex):
     M_flip = torch.tensor([[

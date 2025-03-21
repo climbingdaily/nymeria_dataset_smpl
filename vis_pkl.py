@@ -1,13 +1,32 @@
 import cv2
 import os
+import sys
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import colormaps as cm
 import pickle
+import torch
+from scipy.spatial.transform import Rotation as R
 
-from sam2.build_sam import build_sam2_video_predictor
+from pytorch3d.utils import cameras_from_opencv_projection
+from pytorch3d.structures import Meshes
+from pytorch3d.renderer import (    
+    RasterizationSettings,    
+    MeshRasterizer,    
+    MeshRenderer,
+    SoftSilhouetteShader,
+    SoftGouraudShader,
+    HardFlatShader,
+    MeshRendererWithFragments,
+    PerspectiveCameras,)
 
+sys.path.append('.')
+sys.path.append('..')
+
+
+from smpl import SMPL_Layer
+from utils import poses_to_vertices_torch
 def sam2_tracking_function(prompts:dict, predictor, inference_state, mask_dict:dict, img_list):
     # lefthand_id = 1
     # righthand_id = 2
@@ -79,35 +98,213 @@ def copy_images(img_folder, s, e):
         raise ValueError("No images found in the folder.")
     
     return image_list, new_folder
+class SmplParams:
+    # Shared parameters across all instances
+    _pose = np.array([])  
+    _trans = np.array([])
+    _betas = np.array([])
+    _gender = 'Neutral'  # Default gender
+
+    @classmethod
+    def _ensure_list_or_array(cls, value, name):
+        """Ensures the value is a list or NumPy array."""
+        if isinstance(value, (list, np.ndarray)):
+            return np.array(value) if isinstance(value, list) else value
+        raise TypeError(f"{name} must be a list or NumPy array")
+
+    @property
+    def pose(self):
+        return SmplParams._pose
+
+    @pose.setter
+    def pose(self, value):
+        SmplParams._pose = self._ensure_list_or_array(value, "pose")
+
+    @property
+    def trans(self):
+        return SmplParams._trans
+
+    @trans.setter
+    def trans(self, value):
+        SmplParams._trans = self._ensure_list_or_array(value, "trans")
+
+    @property
+    def betas(self):
+        return SmplParams._betas
+
+    @betas.setter
+    def betas(self, value):
+        SmplParams._betas = self._ensure_list_or_array(value, "betas")
+
+    @property
+    def gender(self):
+        return SmplParams._gender
+
+    @gender.setter
+    def gender(self, value):
+        if value not in {'neutral', 'male', 'female'}:
+            raise ValueError("gender must be 'neutral', 'male', or 'female'")
+        SmplParams._gender = value
+
+    def __repr__(self):
+        return (f"SmplParams(pose={self.pose.tolist()}, trans={self.trans.tolist()}, "
+                f"betas={betas.tolist()}, gender='{self.gender}')")
 
 class ImageAnnotator:
     def __init__(self, img_folder, sam2_function, start, end):
         self.sam2_function = sam2_function  
 
-        self.rotate_image = input("Enter 0 or 1 for rotating the image: ")
-        try:
-            self.rotate_image = bool(int(self.rotate_image))
-        except ValueError:
-            print("Invalid rotating input, defaulting to 0.")
-            self.rotate_image = False
+        self.rotate_image = True
 
         self.image_list, self.img_folder = copy_images(img_folder, start, end)        
         self.index = 0  
+        self.max_index = 20
 
         # load prompt if it exists
         prompt_file = os.path.join(os.path.dirname(self.img_folder), 
                                    f"prompts_{os.path.basename(self.img_folder)}.pkl")
         mask_file = os.path.join(os.path.dirname(self.img_folder), 
                                  f"mask_{os.path.basename(self.img_folder)}.pkl")
+        
+        pkl_file = '/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd/log/2025-03-18T18:23:41_.pkl'
+
+        if os.path.exists(pkl_file):
+            with open(pkl_file, 'rb') as f:
+                synced_data = pickle.load(f)
+        else:
+            synced_data = {}
+        self.proj_img_list = []
+        self.proj_img_list2 = []
+        
+        # =================================================================
+        person = 'first_person'
+        human_data             = synced_data[person]
+        camera_params          = synced_data[person]['cam_head']
+        sensor_traj            = synced_data[person]['lidar_traj'].copy()
+        self.data_length       = len(synced_data['frame_num'])
+        # self.frame_time        = synced_data['device_ts']    
+        SMPL   = SmplParams()
+
+        if 'manual_pose' in human_data:
+            SMPL.pose = human_data['manual_pose'].copy()    # (n, 24, 3)
+        else:
+            SMPL.pose = human_data['pose'].copy()           # (n, 24, 3)
+        self.synced_imu_trans = human_data['mocap_trans'].copy()        # (n, 3)
+
+        if 'T_sensor_head' in human_data:
+            self.head2sensor = torch.tensor(human_data['T_sensor_head']).float()
+
+        # Transformation from the sensor (camera of lidar)
+        SMPL.trans = human_data['trans'].copy()  # (n, 3)   
+
+        if 'beta' in human_data:
+            betas = torch.from_numpy(np.array(human_data['beta'])).float()
+        else:
+            betas = torch.zeros(10).float()
+
+        if 'gender' in human_data:
+            SMPL.gender = human_data['gender']
+        # =================================================================
+        if end > self.data_length:
+            end = self.data_length
+        # =================================================================
+        opt_trans = human_data['opt_trans'][start: end].copy()
+        opt_pose = human_data['opt_pose'][start: end].copy()
+        #sensor_ori_params = torch.from_numpy(SMPL.trans[start: end, 4:8])
+        trans = torch.from_numpy(SMPL.trans[start: end])
+
+        sensor_t  = np.array([np.eye(4)] * self.data_length)
+        sensor_t[:, :3, :3] = R.from_quat(sensor_traj[:, 4:8]).as_matrix()
+        sensor_t[:, :3, 3:] = sensor_traj[:, 1:4].reshape(-1, 3, 1)
+        sensor_t = torch.from_numpy(sensor_t[start: end])
+            
+        mocap_trans_params = torch.from_numpy(self.synced_imu_trans[start: end])
+
+        ori_params  = torch.from_numpy(SMPL.pose[start: end])[:, :3]
+        pose_params = torch.from_numpy(SMPL.pose[start: end])[:, 3:]
+        
+        smpl_layer = SMPL_Layer(gender=SMPL.gender)
+
+        if True:
+            smpl_layer.cuda()
+            betas         = betas.unsqueeze(0).type(torch.FloatTensor).cuda()
+            trans              = trans.type(torch.FloatTensor).cuda()
+            sensor_t           = sensor_t.type(torch.FloatTensor).cuda()
+            mocap_trans_params = mocap_trans_params.type(torch.FloatTensor).cuda()
+            ori_params         = ori_params.type(torch.FloatTensor).cuda()
+            pose_params        = pose_params.type(torch.FloatTensor).cuda()
+
+        #sensor_ori_params
+        params = {'trans': trans,   # translation from the camera
+                    'mocap_trans': mocap_trans_params,  # translation from the imu
+                    'ori': ori_params,
+                    'pose': pose_params,
+                    'sensor_traj':sensor_t,
+                    'cameras': {'w': camera_params['w'],
+                                'h': camera_params['h'],
+                                'intrinsic': camera_params['intrinsic'],
+                                'extrinsic': camera_params['extrinsic'][start:end],
+                                } 
+        }
+        # cameras setting
+        ex = torch.tensor(params['cameras']['extrinsic']).float()   # (B, 4, 4)
+        image_size  = torch.tensor([[params['cameras']['h'], params['cameras']['w']]] * len(ex))
+        f = torch.tensor([params['cameras']['intrinsic'][:2]] * len(ex)).float()
+        c = torch.tensor([params['cameras']['intrinsic'][2:]] * len(ex)).float()
+        K = torch.tensor([[
+            [params['cameras']['intrinsic'][0], 0, params['cameras']['intrinsic'][2]],
+            [0, params['cameras']['intrinsic'][1], params['cameras']['intrinsic'][3]],
+            [0, 0, 1]
+            ]] * len(ex))
+        cameras = cameras_from_opencv_projection(R=ex[:, :3, :3].cuda(), tvec=ex[:, :3, 3].cuda(), 
+                                                 image_size=image_size.cuda(), 
+                                                 camera_matrix=K.cuda())
+
+        smpl_verts, _, _ = poses_to_vertices_torch(
+            SMPL.pose[start: end], trans, betas=betas, gender=SMPL.gender)   
+        
+        smpl_verts_2, _, _ = poses_to_vertices_torch(
+            opt_pose, opt_trans, betas=betas, gender=SMPL.gender)   
+             
+        mesh = Meshes(verts=[v for v in smpl_verts], faces=[smpl_layer.th_faces] * len(smpl_verts))
+        mesh2 = Meshes(verts=[v for v in smpl_verts_2], faces=[smpl_layer.th_faces] * len(smpl_verts))
+
+        raster_settings = RasterizationSettings(image_size=1024,   # Resolution    
+                                                blur_radius=0.0,  # No anti-aliasing    
+                                                faces_per_pixel=1, # Number of faces to store)
+                                                cull_backfaces=True,
+                                                perspective_correct=False,
+                                                bin_size=0)
+        for idx, verts in enumerate(smpl_verts):    
+            if idx > self.max_index:
+                break
+            rasterizer = MeshRasterizer(cameras=cameras[idx],    
+                                        raster_settings=raster_settings)
+            sil_renderer = MeshRenderer(rasterizer=rasterizer, 
+                                        shader=SoftSilhouetteShader())
+            sil = sil_renderer(mesh[idx])
+            sil2 = sil_renderer(mesh2[idx])
+            proj_img = ((sil[..., 3]>0).int().reshape(1024,1024,1).detach().cpu().numpy() * np.array([[0,0,255]])).astype(np.uint8)
+            proj_img2 = ((sil2[..., 3]>0).int().reshape(1024,1024,1).detach().cpu().numpy() * np.array([[0,200,0]])).astype(np.uint8)
+            self.proj_img_list.append(proj_img)
+            self.proj_img_list2.append(proj_img2)
+        # =================================================================
+
         if os.path.exists(prompt_file):
             with open(prompt_file, 'rb') as f:
                 self.prompt_dict = pickle.load(f)
         else:
             self.prompt_dict = {}
 
+        if os.path.exists(prompt_file):
+            with open(prompt_file, 'rb') as f:
+                self.prompt_dict = pickle.load(f)
+        else:
+            self.prompt_dict = {}
         if os.path.exists(mask_file):
             with open(mask_file, 'rb') as f:
                 self.mask_dict = pickle.load(f)
+
             if self.rotate_image:
                 for k, v in self.mask_dict.items():
                     v[1] = cv2.rotate(v[1][0].astype(np.uint8), cv2.ROTATE_90_CLOCKWISE)[None, ...]
@@ -121,28 +318,20 @@ class ImageAnnotator:
         # 创建窗口
         cv2.namedWindow("Image Annotator")
         cv2.setMouseCallback("Image Annotator", self.mouse_callback)
-        self.predictor, self.inference_state =  init_predictor(self.img_folder)
 
         self.load_image()
-        
-    def prop_predict(self, ):
-        for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(self.inference_state):
-            fname = self.image_list[out_frame_idx]
-            self.mask_dict[fname] = {
-                out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
-                for i, out_obj_id in enumerate(out_obj_ids)
-            }
 
     def load_image(self, view=True):
         """load the image based on the current index"""
+        self.index = self.index % self.max_index
         img_path = os.path.join(self.img_folder, self.image_list[self.index])
         self.img = cv2.imread(img_path)
         if self.img is None:
             print(f"Error loading image: {img_path}")
-            return
+            return  
         
-        if self.rotate_image:
-            self.img = cv2.rotate(self.img, cv2.ROTATE_90_CLOCKWISE)
+        # if self.rotate_image:
+        #     self.img = cv2.rotate(self.img, cv2.ROTATE_90_CLOCKWISE)
 
         return self.show_image(view)
     
@@ -150,21 +339,27 @@ class ImageAnnotator:
         """显示图片，并在顶部绘制文件名，如果有mask，则叠加mask"""
         img_display = self.img.copy()
         fname = self.image_list[self.index]
-        
+        proj_img = self.proj_img_list[self.index]
+        proj_img2 = self.proj_img_list2[self.index]
+        # img_display = cv2.addWeighted(img_display, 1.0, cv2.rotate(proj_img2, cv2.ROTATE_90_CLOCKWISE), 0.5, 0)
+
+        img_display = cv2.addWeighted(img_display, 1.0, cv2.rotate(proj_img + proj_img2, cv2.ROTATE_90_CLOCKWISE), 0.3, 0)
+
         if fname in self.mask_dict:
             colormap = cm.get_cmap("tab10")
             for obj_id, mask in self.mask_dict[fname].items():
                 color = (np.array(colormap(obj_id % 10)[:3]) * 255).astype(np.uint8)
                 h, w = mask.shape[-2:]
                 mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
-                img_display = cv2.addWeighted(img_display, 1.0, mask_image, 0.3, 0)
+                img_display = cv2.addWeighted(img_display, 1.0, mask_image, 0.5, 0)
         
         if fname in self.prompt_dict:
             colormap = cm.get_cmap("tab10")
             for obj_id, prompt in self.prompt_dict[fname].items():
                 for point, label in zip(prompt["point"], prompt["label"]):
                     color = (np.array(colormap(label % 10)[:3]) * 255).astype(np.uint8)
-                    cv2.circle(img_display, tuple(point), 5, color.tolist(), -1)
+                    cv2.circle(img_display, tuple(point), 5
+                               , color.tolist(), -1)
         
         cv2.putText(img_display, fname, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         if view:
@@ -199,7 +394,6 @@ class ImageAnnotator:
                 self.prompt_dict[frame_name][obj_id]["label"].append(label)
             print(f"Updated prompt for frame {self.index} ({frame_name}): {{'points': [{x}, {y}], 'obj_id': {obj_id}, 'label': {label}}}")
             self.adding_object = False
-            self.sam2_function(self.prompt_dict, self.predictor, self.inference_state, self.mask_dict, self.image_list)
             self.load_image()  # 重新加载图片并绘制 mask
 
     
@@ -216,7 +410,6 @@ class ImageAnnotator:
                 self.adding_object = True  # 进入等待鼠标点击模式
             elif key == ord('t'):
                 print("Tracking started...")
-                self.sam2_function(self.prompt_dict, self.predictor, self.inference_state, self.mask_dict, self.image_list)  
                 self.load_image()  # 重新加载图片并绘制 mask
             elif key == 83:  # 右箭头键
                 self.index = min(self.index + 1, len(self.image_list) - 1)
@@ -269,24 +462,6 @@ class ImageAnnotator:
             self.video_writer = None
         self.is_recording = False
         print(f"Video saved at {self.video_filename}")
-
-    def save_mask(self, img_dir):
-        """将 mask_dict 保存到 pickle 文件"""
-        out_mask = os.path.join(os.path.dirname(img_dir), f"mask_{os.path.basename(img_dir)}.pkl")
-        out_prompts = os.path.join(os.path.dirname(img_dir), f"prompts_{os.path.basename(img_dir)}.pkl")
-
-        if self.rotate_image:
-           for k, v in self.mask_dict.items():
-                 v[1] = cv2.rotate(v[1][0].astype(np.uint8), cv2.ROTATE_90_COUNTERCLOCKWISE)[None, ...]
-                 v[2] = cv2.rotate(v[2][0].astype(np.uint8), cv2.ROTATE_90_COUNTERCLOCKWISE)[None, ...]
-
-        with open(out_mask, "wb") as f:
-            pickle.dump(self.mask_dict, f)
-        print(f"Mask dictionary saved to {out_mask}")
-
-        with open(out_prompts, "wb") as f:
-            pickle.dump(self.prompt_dict, f)
-        print(f"Prompt dictionary saved to {out_prompts}")
 
 # 用法示例
 if __name__ == "__main__":

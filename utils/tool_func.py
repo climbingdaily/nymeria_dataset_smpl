@@ -444,6 +444,7 @@ def poses_to_vertices_torch(poses, trans, batch_size = 128, betas=torch.zeros(10
     Returns:
       vertices, joints, global_rots
     """
+    assert len(poses) == len(trans)
     if type(poses) != torch.Tensor:
         poses = torch.from_numpy(poses.astype(np.float32))
     if type(trans) != torch.Tensor:
