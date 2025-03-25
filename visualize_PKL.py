@@ -8,6 +8,7 @@ from matplotlib import colormaps as cm
 import pickle
 import torch
 from scipy.spatial.transform import Rotation as R
+from tqdm import tqdm
 
 from pytorch3d.utils import cameras_from_opencv_projection
 from pytorch3d.structures import Meshes
@@ -16,58 +17,48 @@ from pytorch3d.renderer import (
     MeshRasterizer,    
     MeshRenderer,
     SoftSilhouetteShader,
-    SoftGouraudShader,
-    HardFlatShader,
-    MeshRendererWithFragments,
     PerspectiveCameras,)
 
 sys.path.append('.')
 sys.path.append('..')
 
 
-from smpl import SMPL_Layer
-from utils import poses_to_vertices_torch
-from 3rdParties.human_body_prior.body_model.body_model import BodyModel
+from smpl import SMPL_Layer, load_body_models, SmplParams, rotation_matrix_to_axis_angle
+from utils import poses_to_vertices_torch, smplh_to_vertices_torch, Renderer
 
-def load_body_models(gender = 'neutral', support_dir='support_data/', num_betas=16, num_dmpls=8):
-    # Load SMPL body models (here we load
-    # @support_dir, path to the body model directory
-    # @num_betas, body shape parameters
-    # @num_dmpls, DMPL parameters
-    bm_fname   = os.path.join(support_dir, f'body_models/smplh/{gender}/model.npz')
-    dmpl_fname = os.path.join(support_dir, f'body_models/dmpls/{gender}/model.npz')
+LIGHT_RED=(1.0,  0.35686275,  0.31372549)
+LIGHT_BLUE=(0.2, 0.6, 1.0)
 
-    bm   = BodyModel(bm_fname=bm_fname, num_betas=num_betas, num_dmpls=num_dmpls, dmpl_fname=dmpl_fname)#.to(comp_device)
+def get_black_mask_r(img, threshold=10, kernel_size=(5, 5)):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    h, w = img.shape[:2]
+    cx, cy = w // 2, h // 2  # 图像的中心点
+ 
+    _, mask = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY_INV)
+    
+    # 可选：腐蚀和膨胀，去掉小的黑色噪声
+    kernel = np.ones(kernel_size, np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    xx, yy = mask[:h//3, :w//3].nonzero()
+    distances=  []
+    for (x, y) in zip(xx, yy):
+        distance = np.sqrt((x - h/2)**2 + (y - w//2)**2)  # 计算欧几里得距离
+        distances.append(distance)
 
-    return bm
+    return min(distances) / (h/2)
+def create_distance_mask(h=1024, w=1024, r=1.174):
+    cx, cy = w // 2, h // 2  # 图像的中心点
+    r = r * w / 2
+    mask = np.zeros((h, w), dtype=np.uint8)
+    
+    for y in range(h):
+        for x in range(w):
+            distance = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)  # 计算到中心的距离
+            if distance >= r:
+                mask[y, x] = 255  # 距离大于 r 的区域设为 255
 
-def sam2_tracking_function(prompts:dict, predictor, inference_state, mask_dict:dict, img_list):
-    # lefthand_id = 1
-    # righthand_id = 2
-    print("SAM2 tracking with prompts:", prompts)
-    # predictor.reset_state(inference_state)
-    for frame_name, prompt in prompts.items():
-        if frame_name not in mask_dict:
-            mask_dict[frame_name] = {}
-        idx = img_list.index(frame_name)
-        for obj_id in prompt:
-
-            # for labels, `1` means positive click and `0` means negative click
-            points = prompt[obj_id]['point']
-            labels = np.array(prompt[obj_id]['label'], np.int32)
-            
-            _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
-                inference_state=inference_state,
-                frame_idx=idx,
-                obj_id=obj_id,
-                points=points,
-                labels=labels,
-            )
-            
-            for i, id in enumerate(out_obj_ids):
-                mask_dict[frame_name][id] = (out_mask_logits[i] > 0.0).cpu().numpy()
-            
-            print(f"Processed tracking for frame {idx} ({frame_name}) with obj_id {obj_id}: {points}.")
+    return mask
 
 def print_key_functions():
     print("Key Functions:")
@@ -112,79 +103,68 @@ def copy_images(img_folder, s, e):
         raise ValueError("No images found in the folder.")
     
     return image_list, new_folder
-class SmplParams:
-    # Shared parameters across all instances
-    _pose = np.array([])  
-    _trans = np.array([])
-    _betas = np.array([])
-    _gender = 'Neutral'  # Default gender
+def convert_smplh_right_to_left(pose_right_hand):
+    """
+    使用旋转矩阵方法，将右手的 SMPL-H 轴角 Pose 转换为左手 Pose
+    :param pose_right_hand: (15, 3) 右手的 Pose（轴角格式）
+    :return: (15, 3) 左手的 Pose
+    """
+    pose_left_hand = np.zeros_like(pose_right_hand)
 
-    @classmethod
-    def _ensure_list_or_array(cls, value, name):
-        """Ensures the value is a list or NumPy array."""
-        if isinstance(value, (list, np.ndarray)):
-            return np.array(value) if isinstance(value, list) else value
-        raise TypeError(f"{name} must be a list or NumPy array")
+    for i in range(15):
+        # 将轴角转换为旋转矩阵
+        rot_mat = R.from_rotvec(pose_right_hand[i]).as_matrix()
 
-    @property
-    def pose(self):
-        return SmplParams._pose
+        # 定义 YZ 平面的镜像矩阵
+        M = np.array([
+            [1,  0,  0],  # X 轴不变
+            [0, -1,  0],  # Y 轴取反
+            [0,  0, -1]   # Z 轴取反
+        ])
 
-    @pose.setter
-    def pose(self, value):
-        SmplParams._pose = self._ensure_list_or_array(value, "pose")
+        # 变换旋转矩阵
+        rot_mat_mirrored = M @ rot_mat @ M
 
-    @property
-    def trans(self):
-        return SmplParams._trans
+        # 变回轴角
+        pose_left_hand[i] = R.from_matrix(rot_mat_mirrored).as_rotvec()
 
-    @trans.setter
-    def trans(self, value):
-        SmplParams._trans = self._ensure_list_or_array(value, "trans")
-
-    @property
-    def betas(self):
-        return SmplParams._betas
-
-    @betas.setter
-    def betas(self, value):
-        SmplParams._betas = self._ensure_list_or_array(value, "betas")
-
-    @property
-    def gender(self):
-        return SmplParams._gender
-
-    @gender.setter
-    def gender(self, value):
-        if value not in {'neutral', 'male', 'female'}:
-            raise ValueError("gender must be 'neutral', 'male', or 'female'")
-        SmplParams._gender = value
-
-    def __repr__(self):
-        return (f"SmplParams(pose={self.pose.tolist()}, trans={self.trans.tolist()}, "
-                f"betas={betas.tolist()}, gender='{self.gender}')")
-
+    return pose_left_hand
 class ImageAnnotator:
-    def __init__(self, img_folder, sam2_function, pkl_file, start, end):
-        self.sam2_function = sam2_function  
+    def __init__(self, img_folder, pkl_file, start, end):
 
         self.rotate_image = True
 
         self.image_list, self.img_folder = copy_images(img_folder, start, end)        
         self.index = 0  
-        self.max_index = 20
+        self.max_index = 300
 
         # load prompt if it exists
         prompt_file = os.path.join(os.path.dirname(self.img_folder), 
                                    f"prompts_{os.path.basename(self.img_folder)}.pkl")
         mask_file = os.path.join(os.path.dirname(self.img_folder), 
                                  f"mask_{os.path.basename(self.img_folder)}.pkl")
+        mano_file = os.path.join(os.path.dirname(self.img_folder), 
+                                 f"mano_{os.path.basename(self.img_folder)}.pkl")
         
         if os.path.exists(pkl_file):
             with open(pkl_file, 'rb') as f:
                 synced_data = pickle.load(f)
         else:
             synced_data = {}
+
+        hand_poses = torch.zeros((len(self.image_list), 2, 15, 3))
+        if os.path.exists(mano_file):
+            with open(mano_file, 'rb') as f:
+                mano_data = pickle.load(f)
+            for idx, (_, v) in enumerate(mano_data.items()):
+                for i, r in enumerate(v['right']):
+                    hp = rotation_matrix_to_axis_angle(torch.tensor(v['hand_pose'][i]))
+                    if r == 0:
+                        hp[:, 1:] *= -1
+                    hand_poses[idx][r] = hp
+
+        hand_poses = hand_poses.reshape(-1, 30, 3)
+
         self.proj_img_list = []
         self.proj_img_list2 = []
         
@@ -195,7 +175,7 @@ class ImageAnnotator:
         sensor_traj            = synced_data[person]['lidar_traj'].copy()
         self.data_length       = len(synced_data['frame_num'])
         # self.frame_time        = synced_data['device_ts']    
-        SMPL   = SmplParams()
+        SMPL = SmplParams()
 
         if 'manual_pose' in human_data:
             SMPL.pose = human_data['manual_pose'].copy()    # (n, 24, 3)
@@ -236,10 +216,12 @@ class ImageAnnotator:
         pose_params = torch.from_numpy(SMPL.pose[start: end])[:, 3:]
         
         smpl_layer = SMPL_Layer(gender=SMPL.gender)
+        body_model = load_body_models(gender=SMPL.gender)
 
         if True:
             smpl_layer.cuda()
-            betas         = betas.unsqueeze(0).type(torch.FloatTensor).cuda()
+            body_model.cuda()
+            betas              = betas.unsqueeze(0).type(torch.FloatTensor).cuda()
             trans              = trans.type(torch.FloatTensor).cuda()
             sensor_t           = sensor_t.type(torch.FloatTensor).cuda()
             mocap_trans_params = mocap_trans_params.type(torch.FloatTensor).cuda()
@@ -251,6 +233,7 @@ class ImageAnnotator:
                     'mocap_trans': mocap_trans_params,  # translation from the imu
                     'ori': ori_params,
                     'pose': pose_params,
+                    'hand_pose': hand_poses.cuda(),
                     'sensor_traj':sensor_t,
                     'cameras': {'w': camera_params['w'],
                                 'h': camera_params['h'],
@@ -271,35 +254,36 @@ class ImageAnnotator:
         cameras = cameras_from_opencv_projection(R=ex[:, :3, :3].cuda(), tvec=ex[:, :3, 3].cuda(), 
                                                  image_size=image_size.cuda(), 
                                                  camera_matrix=K.cuda())
-
-        smpl_verts, _, _ = poses_to_vertices_torch(
-            SMPL.pose[start: end], trans, betas=betas, gender=SMPL.gender)   
+        smpl_verts, _ = smplh_to_vertices_torch(SMPL.pose[start: end], trans, hand_poses, betas=betas, gender=SMPL.gender)
+        smpl_verts_2, _ = smplh_to_vertices_torch(opt_pose, opt_trans, hand_poses, betas=betas, gender=SMPL.gender)
+        self.empty_mask = create_distance_mask(camera_params['w'], camera_params['h'])
         
-        smpl_verts_2, _, _ = poses_to_vertices_torch(
-            opt_pose, opt_trans, betas=betas, gender=SMPL.gender)   
-             
-        mesh = Meshes(verts=[v for v in smpl_verts], faces=[smpl_layer.th_faces] * len(smpl_verts))
-        mesh2 = Meshes(verts=[v for v in smpl_verts_2], faces=[smpl_layer.th_faces] * len(smpl_verts))
+        render = Renderer(resolution=(camera_params['w'], camera_params['h']), wireframe=False)
 
-        raster_settings = RasterizationSettings(image_size=1024,   # Resolution    
-                                                blur_radius=0.0,  # No anti-aliasing    
-                                                faces_per_pixel=1, # Number of faces to store)
-                                                cull_backfaces=True,
-                                                perspective_correct=False,
-                                                bin_size=0)
-        for idx, verts in enumerate(smpl_verts):    
-            if idx > self.max_index:
-                break
-            rasterizer = MeshRasterizer(cameras=cameras[idx],    
-                                        raster_settings=raster_settings)
-            sil_renderer = MeshRenderer(rasterizer=rasterizer, 
-                                        shader=SoftSilhouetteShader())
-            sil = sil_renderer(mesh[idx])
-            sil2 = sil_renderer(mesh2[idx])
-            proj_img = ((sil[..., 3]>0).int().reshape(1024,1024,1).detach().cpu().numpy() * np.array([[0,0,255]])).astype(np.uint8)
-            proj_img2 = ((sil2[..., 3]>0).int().reshape(1024,1024,1).detach().cpu().numpy() * np.array([[0,200,0]])).astype(np.uint8)
-            self.proj_img_list.append(proj_img)
-            self.proj_img_list2.append(proj_img2)
+        for idx, verts in tqdm(enumerate(smpl_verts[:self.max_index]), total=self.max_index, desc="Renderring verts"):
+
+            img = render.render(
+                np.zeros((camera_params['w'], camera_params['h'], 4)),
+                smpl_model    = (verts.cpu(), smpl_layer.th_faces.cpu()),
+                cam           = (camera_params['intrinsic'], ex[idx].cpu()),
+                color         = LIGHT_BLUE,
+                human_pc      = None,
+                sence_pc_pose = None,
+                mesh_filename = None,
+                a=0.5)
+
+            img2 = render.render(
+                np.zeros((camera_params['w'], camera_params['h'], 4)),
+                smpl_model    = (smpl_verts_2[idx].cpu(), smpl_layer.th_faces.cpu()),
+                cam           = (camera_params['intrinsic'], ex[idx].cpu()),
+                color         = LIGHT_RED,
+                human_pc      = None,
+                sence_pc_pose = None,
+                mesh_filename = None,
+                a=0.5)
+            
+            self.proj_img_list.append(img)
+            self.proj_img_list2.append(img2)
         # =================================================================
 
         if os.path.exists(prompt_file):
@@ -308,11 +292,6 @@ class ImageAnnotator:
         else:
             self.prompt_dict = {}
 
-        if os.path.exists(prompt_file):
-            with open(prompt_file, 'rb') as f:
-                self.prompt_dict = pickle.load(f)
-        else:
-            self.prompt_dict = {}
         if os.path.exists(mask_file):
             with open(mask_file, 'rb') as f:
                 self.mask_dict = pickle.load(f)
@@ -332,8 +311,7 @@ class ImageAnnotator:
         cv2.setMouseCallback("Image Annotator", self.mouse_callback)
 
         self.load_image()
-
-    def load_image(self, view=True):
+    def load_image(self, view=True, show=True):
         """load the image based on the current index"""
         self.index = self.index % self.max_index
         img_path = os.path.join(self.img_folder, self.image_list[self.index])
@@ -344,8 +322,8 @@ class ImageAnnotator:
         
         # if self.rotate_image:
         #     self.img = cv2.rotate(self.img, cv2.ROTATE_90_CLOCKWISE)
-
-        return self.show_image(view)
+        if show:
+            return self.show_image(view)
     
     def show_image(self, view=True):
         """显示图片，并在顶部绘制文件名，如果有mask，则叠加mask"""
@@ -353,9 +331,6 @@ class ImageAnnotator:
         fname = self.image_list[self.index]
         proj_img = self.proj_img_list[self.index]
         proj_img2 = self.proj_img_list2[self.index]
-        # img_display = cv2.addWeighted(img_display, 1.0, cv2.rotate(proj_img2, cv2.ROTATE_90_CLOCKWISE), 0.5, 0)
-
-        img_display = cv2.addWeighted(img_display, 1.0, cv2.rotate(proj_img + proj_img2, cv2.ROTATE_90_CLOCKWISE), 0.3, 0)
 
         if fname in self.mask_dict:
             colormap = cm.get_cmap("tab10")
@@ -373,6 +348,9 @@ class ImageAnnotator:
                     cv2.circle(img_display, tuple(point), 5
                                , color.tolist(), -1)
         
+        img_display = cv2.addWeighted(img_display, 1.0, cv2.rotate(proj_img[:, :, :3], cv2.ROTATE_90_CLOCKWISE), 0.3, 0)
+        img_display = cv2.addWeighted(img_display, 1.0, cv2.rotate(proj_img2[:, :, :3], cv2.ROTATE_90_CLOCKWISE), 0.9, 0)
+        img_display[self.empty_mask > 0] = 0
         cv2.putText(img_display, fname, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         if view:
             cv2.imshow("Image Annotator", img_display)
@@ -492,5 +470,5 @@ if __name__ == "__main__":
     start = args.start
     end = args.end
     
-    annotator = ImageAnnotator(img_folder, sam2_tracking_function, args.pkl_path, start, end)
+    annotator = ImageAnnotator(img_folder, args.pkl_path, start, end)
     annotator.run()

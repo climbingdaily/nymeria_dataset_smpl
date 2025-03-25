@@ -24,7 +24,7 @@ import json
 import matplotlib.pyplot as plt
 sys.path.append(os.path.dirname(os.path.split(os.path.abspath( __file__))[0]))
 
-from smpl import SMPL, SMPL_Layer, SMPL_SAMPLE_PLY, COL_NAME
+from smpl import SMPL, SMPL_Layer, SMPL_SAMPLE_PLY, COL_NAME, load_body_models
 from utils import get_pose_from_bvh, MOCAP_INIT, pypcd, get_smpl_pose_from_xsense_keypoints
 
 def write_pcd(filepath, data, rgb=None, intensity=None, mode='wb') -> None:
@@ -484,6 +484,45 @@ def poses_to_vertices_torch(poses, trans, batch_size = 128, betas=torch.zeros(10
         global_rots = torch.cat((global_rots, cur_rots))
 
     return vertices, joints, global_rots
+
+def smplh_to_vertices_torch(poses, trans, pose_hand, batch_size = 128, betas=torch.zeros(10), gender='male', is_cuda=True):
+    assert len(poses) == len(trans)
+    def set_var(vars):
+        for i, v in enumerate(vars):  
+            if not isinstance(v, torch.Tensor):  
+                v = torch.from_numpy(v.astype(np.float32))
+            if is_cuda and v.device.type != 'cuda':
+                v = v.cuda()
+            vars[i] = v
+        return vars
+    poses, trans, pose_hand, betas = set_var([poses, trans, pose_hand, betas])
+
+    body_model = load_body_models(gender=gender)
+
+    if is_cuda:
+        body_model = body_model.cuda()
+        
+    # batch_size = 128
+    n = len(poses)
+    n_batch = (n + batch_size - 1) // batch_size
+
+    vertices = []
+    joints = []
+    global_rots = []
+
+    for i in range(n_batch):
+        lb = i * batch_size
+        ub = (i + 1) * batch_size
+        ub = min(ub, n)
+
+        body_pose_world = body_model(root_orient = poses[lb:ub, :3], 
+                                     pose_body = poses[lb:ub, 3:66],
+                                     trans=trans[lb:ub],
+                                     pose_hand=pose_hand[lb:ub].reshape(-1, 90))
+        vertices.append(body_pose_world.v)
+        joints.append(body_pose_world.Jtr)
+
+    return torch.cat(vertices), torch.cat(joints)
 
 def poses_to_vertices(poses, batch_size = 128, trans=None, is_cuda=True):
     """

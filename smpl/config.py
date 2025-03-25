@@ -12,14 +12,85 @@ from os.path import join
 
 import numpy as np
 
+from ThirdParties.human_body_prior.body_model.body_model import BodyModel
+
 SMPL_DIR = os.path.split(os.path.abspath( __file__))[0]
 
 SMPL_NEUTRAL = os.path.join(SMPL_DIR, 'smpl', 'SMPL_NEUTRAL.pkl')
 SMPL_FEMALE = os.path.join(SMPL_DIR, 'smpl', 'SMPL_FEMALE.pkl')
 SMPL_MALE = os.path.join(SMPL_DIR, 'smpl', 'SMPL_MALE.pkl')
 
+SMPLH_NEUTRAL = os.path.join(SMPL_DIR, 'body_models', 'smplh', 'neutral', 'model.npz')
+SMPLH_FEMALE = os.path.join(SMPL_DIR, 'body_models', 'smplh', 'female', 'model.npz')
+SMPLH_MALE = os.path.join(SMPL_DIR, 'body_models', 'smplh', 'male', 'model.npz')
+
 SMPL_SAMPLE_PLY = os.path.join(SMPL_DIR, 'smpl_sample.ply')
 
+def load_body_models(gender = 'neutral', support_dir=os.path.dirname(__file__), num_betas=10, num_dmpls=0):
+    bm_fname   = os.path.join(support_dir, f'body_models/smplh/{gender}/model.npz')
+    dmpl_fname = os.path.join(support_dir, f'body_models/dmpls/{gender}/model.npz')
+    bm = BodyModel(bm_fname=bm_fname, num_betas=num_betas, num_dmpls=num_dmpls, dmpl_fname=dmpl_fname)#.to(comp_device)
+    return bm
+class SmplParams:
+    # Shared parameters across all instances
+    _pose = np.array([])  
+    _trans = np.array([])
+    _hand_pose = np.array([])
+    _betas = np.array([])
+    _gender = 'Neutral'  # Default gender
+
+    @classmethod
+    def _ensure_list_or_array(cls, value, name):
+        """Ensures the value is a list or NumPy array."""
+        if isinstance(value, (list, np.ndarray)):
+            return np.array(value) if isinstance(value, list) else value
+        raise TypeError(f"{name} must be a list or NumPy array")
+
+    @property
+    def pose(self):
+        return SmplParams._pose
+    
+    @property
+    def hand_pose(self):
+        return SmplParams._hand_pose
+
+    @pose.setter
+    def pose(self, value):
+        SmplParams._pose = self._ensure_list_or_array(value, "pose")
+
+    @hand_pose.setter
+    def _hand_pose(self, value):
+        SmplParams._hand_pose = self._ensure_list_or_array(value, "hand_pose")
+
+    @property
+    def trans(self):
+        return SmplParams._trans
+
+    @trans.setter
+    def trans(self, value):
+        SmplParams._trans = self._ensure_list_or_array(value, "trans")
+
+    @property
+    def betas(self):
+        return SmplParams._betas
+
+    @betas.setter
+    def betas(self, value):
+        SmplParams._betas = self._ensure_list_or_array(value, "betas")
+
+    @property
+    def gender(self):
+        return SmplParams._gender
+
+    @gender.setter
+    def gender(self, value):
+        if value not in {'neutral', 'male', 'female'}:
+            raise ValueError("gender must be 'neutral', 'male', or 'female'")
+        SmplParams._gender = value
+
+    def __repr__(self):
+        return (f"SmplParams(pose={self.pose.tolist()}, trans={self.trans.tolist()}, hand_pose={self.pose.tolist()},"
+                f"betas={self.betas.tolist()}, gender='{self.gender}')")
 """
 Each dataset uses different sets of joints.
 We keep a superset of 24 joints such that we include all joints from every dataset.
@@ -335,3 +406,4 @@ body_seg_verts = {
     'left_leg'  : list(set(verts_seg['leftLeg'] + verts_seg['leftFoot'] + verts_seg['leftToeBase'])),
     'right_leg' : list(set(verts_seg['rightLeg'] + verts_seg['rightFoot'] + verts_seg['rightToeBase']))
 }
+

@@ -24,7 +24,7 @@
 
 import numpy as np
 import torch
-from trdParties.human_body_prior.tools import tgm_conversion as tgm
+from ThirdParties.human_body_prior.tools import tgm_conversion as tgm
 from torch.nn import functional as F
 
 

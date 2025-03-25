@@ -34,7 +34,7 @@ from sam2.build_sam import build_sam2_video_predictor
 
 # get current file's directory 
 current_dir = os.path.dirname(os.path.realpath(__file__))
-SAM_ROOT = os.path.join(current_dir, '3rdParties', 'sam2')
+SAM_ROOT = os.path.join(current_dir, 'ThirdParties', 'sam2')
 
 sam2_checkpoint = f"{SAM_ROOT}/checkpoints/sam2.1_hiera_large.pt"
 model_cfg = f"configs/sam2.1/sam2.1_hiera_l.yaml"
