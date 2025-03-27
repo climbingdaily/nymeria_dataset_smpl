@@ -54,25 +54,25 @@ class SmplParams:
     def hand_pose(self):
         return SmplParams._hand_pose
 
+    @property
+    def trans(self):
+        return SmplParams._trans
+
+    @property
+    def betas(self):
+        return SmplParams._betas
+    
     @pose.setter
     def pose(self, value):
         SmplParams._pose = self._ensure_list_or_array(value, "pose")
 
     @hand_pose.setter
-    def _hand_pose(self, value):
+    def hand_pose(self, value):
         SmplParams._hand_pose = self._ensure_list_or_array(value, "hand_pose")
-
-    @property
-    def trans(self):
-        return SmplParams._trans
 
     @trans.setter
     def trans(self, value):
         SmplParams._trans = self._ensure_list_or_array(value, "trans")
-
-    @property
-    def betas(self):
-        return SmplParams._betas
 
     @betas.setter
     def betas(self, value):

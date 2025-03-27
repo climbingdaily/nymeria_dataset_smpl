@@ -24,7 +24,8 @@ sys.path.append('..')
 
 
 from smpl import SMPL_Layer, load_body_models, SmplParams, rotation_matrix_to_axis_angle
-from utils import poses_to_vertices_torch, smplh_to_vertices_torch, Renderer
+from utils import smplh_to_vertices_torch, Renderer
+from optmization import fill_and_smooth_mano_poses, get_hand_pose
 
 LIGHT_RED=(1.0,  0.35686275,  0.31372549)
 LIGHT_BLUE=(0.2, 0.6, 1.0)
@@ -136,7 +137,7 @@ class ImageAnnotator:
 
         self.image_list, self.img_folder = copy_images(img_folder, start, end)        
         self.index = 0  
-        self.max_index = 300
+        self.max_index = 250
 
         # load prompt if it exists
         prompt_file = os.path.join(os.path.dirname(self.img_folder), 
@@ -152,18 +153,7 @@ class ImageAnnotator:
         else:
             synced_data = {}
 
-        hand_poses = torch.zeros((len(self.image_list), 2, 15, 3))
-        if os.path.exists(mano_file):
-            with open(mano_file, 'rb') as f:
-                mano_data = pickle.load(f)
-            for idx, (_, v) in enumerate(mano_data.items()):
-                for i, r in enumerate(v['right']):
-                    hp = rotation_matrix_to_axis_angle(torch.tensor(v['hand_pose'][i]))
-                    if r == 0:
-                        hp[:, 1:] *= -1
-                    hand_poses[idx][r] = hp
 
-        hand_poses = hand_poses.reshape(-1, 30, 3)
 
         self.proj_img_list = []
         self.proj_img_list2 = []
@@ -189,6 +179,18 @@ class ImageAnnotator:
         # Transformation from the sensor (camera of lidar)
         SMPL.trans = human_data['trans'].copy()  # (n, 3)   
 
+        if 'hand_pose' in human_data:
+            SMPL.hand_pose = human_data['hand_pose'].copy().astype(np.float32)    # (n, 30, 3)
+        else:
+            SMPL.hand_pose = np.zeros((len(human_data['trans']), 30, 3))
+            with open(mano_file, 'rb') as f:
+                mano_data = pickle.load(f)
+            SMPL.hand_pose[start: end] = get_hand_pose(mano_data, len(self.image_list))
+        if 'opt_hand_pose' in human_data:
+            opt_hand_pose = torch.tensor(human_data['opt_hand_pose'][start: end]).float()
+        else:
+            opt_hand_pose = torch.tensor(fill_and_smooth_mano_poses(SMPL.hand_pose[start: end])).float()
+
         if 'beta' in human_data:
             betas = torch.from_numpy(np.array(human_data['beta'])).float()
         else:
@@ -204,6 +206,7 @@ class ImageAnnotator:
         opt_pose = human_data['opt_pose'][start: end].copy()
         #sensor_ori_params = torch.from_numpy(SMPL.trans[start: end, 4:8])
         trans = torch.from_numpy(SMPL.trans[start: end])
+        hand_pose = torch.from_numpy(SMPL.hand_pose[start: end])
 
         sensor_t  = np.array([np.eye(4)] * self.data_length)
         sensor_t[:, :3, :3] = R.from_quat(sensor_traj[:, 4:8]).as_matrix()
@@ -233,7 +236,7 @@ class ImageAnnotator:
                     'mocap_trans': mocap_trans_params,  # translation from the imu
                     'ori': ori_params,
                     'pose': pose_params,
-                    'hand_pose': hand_poses.cuda(),
+                    'hand_pose': hand_pose.cuda(),
                     'sensor_traj':sensor_t,
                     'cameras': {'w': camera_params['w'],
                                 'h': camera_params['h'],
@@ -254,11 +257,11 @@ class ImageAnnotator:
         cameras = cameras_from_opencv_projection(R=ex[:, :3, :3].cuda(), tvec=ex[:, :3, 3].cuda(), 
                                                  image_size=image_size.cuda(), 
                                                  camera_matrix=K.cuda())
-        smpl_verts, _ = smplh_to_vertices_torch(SMPL.pose[start: end], trans, hand_poses, betas=betas, gender=SMPL.gender)
-        smpl_verts_2, _ = smplh_to_vertices_torch(opt_pose, opt_trans, hand_poses, betas=betas, gender=SMPL.gender)
+        smpl_verts, _ = smplh_to_vertices_torch(SMPL.pose[start: end], trans, hand_pose, betas=betas, gender=SMPL.gender)
+        smpl_verts_2, _ = smplh_to_vertices_torch(opt_pose, opt_trans, opt_hand_pose, betas=betas, gender=SMPL.gender)
         self.empty_mask = create_distance_mask(camera_params['w'], camera_params['h'])
         
-        render = Renderer(resolution=(camera_params['w'], camera_params['h']), wireframe=False)
+        render = Renderer(resolution=(camera_params['w'], camera_params['h']), wireframe=True)
 
         for idx, verts in tqdm(enumerate(smpl_verts[:self.max_index]), total=self.max_index, desc="Renderring verts"):
 
@@ -270,7 +273,7 @@ class ImageAnnotator:
                 human_pc      = None,
                 sence_pc_pose = None,
                 mesh_filename = None,
-                a=0.5)
+                a=1)
 
             img2 = render.render(
                 np.zeros((camera_params['w'], camera_params['h'], 4)),
@@ -280,7 +283,7 @@ class ImageAnnotator:
                 human_pc      = None,
                 sence_pc_pose = None,
                 mesh_filename = None,
-                a=0.5)
+                a=1)
             
             self.proj_img_list.append(img)
             self.proj_img_list2.append(img2)
@@ -338,7 +341,7 @@ class ImageAnnotator:
                 color = (np.array(colormap(obj_id % 10)[:3]) * 255).astype(np.uint8)
                 h, w = mask.shape[-2:]
                 mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
-                img_display = cv2.addWeighted(img_display, 1.0, mask_image, 0.5, 0)
+                img_display = cv2.addWeighted(img_display, 1.0, mask_image, 0.4, 0)
         
         if fname in self.prompt_dict:
             colormap = cm.get_cmap("tab10")
@@ -348,8 +351,8 @@ class ImageAnnotator:
                     cv2.circle(img_display, tuple(point), 5
                                , color.tolist(), -1)
         
-        img_display = cv2.addWeighted(img_display, 1.0, cv2.rotate(proj_img[:, :, :3], cv2.ROTATE_90_CLOCKWISE), 0.3, 0)
-        img_display = cv2.addWeighted(img_display, 1.0, cv2.rotate(proj_img2[:, :, :3], cv2.ROTATE_90_CLOCKWISE), 0.9, 0)
+        img_display = cv2.addWeighted(img_display, 1.0, cv2.rotate(proj_img[:, :, :3], cv2.ROTATE_90_CLOCKWISE), 1.0, 0)
+        img_display = cv2.addWeighted(img_display, 1.0, cv2.rotate(proj_img2[:, :, :3], cv2.ROTATE_90_CLOCKWISE), 1.0, 0)
         img_display[self.empty_mask > 0] = 0
         cv2.putText(img_display, fname, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         if view:
@@ -436,11 +439,11 @@ class ImageAnnotator:
         self.video_writer = cv2.VideoWriter(self.video_filename, fourcc, fps, frame_size)  # 创建视频写入对象
 
         # 遍历所有图像，按顺序写入视频
-        for idx, image_name in enumerate(self.image_list):
+        for idx in np.arange(self.max_index):
             self.index = idx  # 更新当前帧
             img = self.load_image(view=True) 
             self.video_writer.write(img) 
-            print(f"Writing frame {idx + 1}/{len(self.image_list)}")
+            print(f"Writing frame {idx + 1}/{self.max_index}")
 
         # 录制完成，释放视频编写器
         self.stop_video_recording()
@@ -456,7 +459,7 @@ class ImageAnnotator:
 # 用法示例
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pkl_path", type=str, default='/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd/log/2025-03-18T18:23:41_.pkl', help="Path to the pkl file")
+    parser.add_argument("--pkl_path", type=str, default='/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd/log/2025-03-27T01:04:12_.pkl', help="Path to the pkl file")
     parser.add_argument("--img_folder", type=str, default='/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd/recording_head/imgs', help="Path to the image folder")
 
     parser.add_argument("-S", "--start", type=int, default=1049,

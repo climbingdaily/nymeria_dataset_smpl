@@ -47,11 +47,14 @@ class ImageAnnotator:
         #     self.rotate_image = bool(int(self.rotate_image))
         # except ValueError:
         #     print("Invalid rotating input, defaulting to 0.")
-        self.rotate_image = False
+        self.rotate_image = True
         self.current_hand = 0
 
         self.image_list, self.img_folder = copy_images(img_folder, start, end)        
         self.index = 0  
+
+        img = cv2.imread(os.path.join(self.img_folder, self.image_list[0]))
+        self.height, self.width = img.shape[:2]
 
         self.video_filename = os.path.join(os.path.dirname(self.img_folder), 
                      f"det_hand_{os.path.basename(self.img_folder)}.mp4")
@@ -63,6 +66,14 @@ class ImageAnnotator:
         if os.path.exists(det_file):
             with open(det_file, 'rb') as f:
                 self.det_dict = pickle.load(f)
+            for k, v in self.det_dict.items():
+                assert len(v) == 2, "more than two hands"
+                if self.rotate_image:
+                    if len(v[0]) == 2:
+                        v[0] = [self.height -v[0][1], v[0][0]]
+                    if len(v[1]) == 2:
+                        v[1] = [self.height -v[1][1], v[1][0]]
+
         else:
             self.det_dict = {iname: [[],[]] for iname in self.image_list}
 
@@ -78,12 +89,13 @@ class ImageAnnotator:
         """load the image based on the current index"""
         img_path = os.path.join(self.img_folder, self.image_list[self.index])
         self.img = cv2.imread(img_path)
+        self.height, self.width = self.img.shape[:2]
         if self.img is None:
             print(f"Error loading image: {img_path}")
             return
         
-        if self.rotate_image:
-            self.img = cv2.rotate(self.img, cv2.ROTATE_90_CLOCKWISE)
+        # if self.rotate_image:
+            # self.img = cv2.rotate(self.img, cv2.ROTATE_90_CLOCKWISE)
 
         return self.show_image(view)
     
@@ -102,7 +114,7 @@ class ImageAnnotator:
             if len(right) == 2:
                 cv2.circle(img_display, tuple(right), 5, c2.tolist(), -1)
         
-        cv2.putText(img_display, fname, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(img_display, f"{self.index}: {fname}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         if view:
             cv2.imshow("Image Annotator", img_display)
         
@@ -185,8 +197,14 @@ class ImageAnnotator:
 
         if self.rotate_image:
            for k, v in self.det_dict.items():
-               v[1] = cv2.rotate(v[1][0].astype(np.uint8), cv2.ROTATE_90_COUNTERCLOCKWISE)[None, ...]
-               v[2] = cv2.rotate(v[2][0].astype(np.uint8), cv2.ROTATE_90_COUNTERCLOCKWISE)[None, ...]
+               assert len(v) == 2, "more than two hands"
+               if len(v[0]) == 2:
+                   # rotate the images  
+                   a, b = v[0]
+                   v[0] = [b, self.width - a]
+               if len(v[1]) == 2:
+                   a, b = v[1]
+                   v[1] = [b, self.width - a]
 
         with open(out_dets, "wb") as f:
             pickle.dump(self.det_dict, f)

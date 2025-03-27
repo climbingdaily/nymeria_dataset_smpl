@@ -230,11 +230,13 @@ class BodyModel(nn.Module):
         if trans is None: trans = self.init_trans.expand(batch_size, -1)
         if v_template is None: v_template = self.init_v_template.expand(batch_size, -1,-1)
         if betas is None: betas = self.init_betas.expand(batch_size, -1)
-
+        pose2rot = True
         if self.model_type in ['smplh', 'smpl']:
             full_pose = torch.cat([root_orient, pose_body, pose_hand], dim=-1)
+            pose2rot = full_pose.shape[-1] == (1 + 21 + 30) * 3
         elif self.model_type == 'smplx':
             full_pose = torch.cat([root_orient, pose_body, pose_jaw, pose_eye, pose_hand], dim=-1)  # orient:3, body:63, jaw:3, eyel:3, eyer:3, handl, handr
+            full_pose.shape[-1] == (1 + 21 + 3 + 30) * 3
         elif self.model_type == 'flame':
             full_pose = torch.cat([root_orient, pose_body, pose_jaw, pose_eye], dim=-1)  # orient:3, body:63, jaw:3, eyel:3, eyer:3, handl, handr
         elif self.model_type in ['mano', ]:
@@ -253,9 +255,10 @@ class BodyModel(nn.Module):
         else:
             shape_components = betas
             shapedirs = self.shapedirs
-
+        if not pose2rot:
+            full_pose = full_pose.view([batch_size, -1, 3, 3])
         verts, Jtr = lbs(betas=shape_components, pose=full_pose, v_template=v_template,
-                            shapedirs=shapedirs, posedirs=self.posedirs,
+                            shapedirs=shapedirs, posedirs=self.posedirs, pose2rot=pose2rot,
                             J_regressor=self.J_regressor, parents=self.kintree_table[0].long(),
                             lbs_weights=self.weights, joints=joints, v_shaped=v_shaped,
                             dtype=self.dtype)

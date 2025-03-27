@@ -42,9 +42,9 @@ from pytorch3d.renderer import (
 sys.path.append(os.path.dirname(os.path.split(os.path.abspath( __file__))[0]))
 
 import ChamferDistancePytorch.chamfer3D.dist_chamfer_3D as cham
-import ChamferDistancePytorch.chamfer2D.dist_chamfer_2D as cham2D
+# import ChamferDistancePytorch.chamfer2D.dist_chamfer_2D as cham2D
 distChamfer = cham.chamfer_3DDist()
-cham2d = cham2D.chamfer_2DDist()
+# cham2d = cham2D.chamfer_2DDist()
 
 from utils import read_json_file
 from smpl import axis_angle_to_rotation_matrix, rotation_matrix_to_axis_angle, BODY_PARTS as BP
@@ -66,7 +66,22 @@ __all__ = ['trans_imu_smooth',
            'points2smpl_loss', 
            'collision_loss', 
            'load_vertices',
-           'cam_loss']
+           'cam_loss',
+           'reprojection_loss',
+           'create_distance_mask']
+
+def create_distance_mask(h=1024, w=1024, r=1.174):
+    cx, cy = w // 2, h // 2  # 图像的中心点
+    r = r * w / 2
+    mask = np.zeros((h, w), dtype=np.uint8)
+    
+    for y in range(h):
+        for x in range(w):
+            distance = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)  # 计算到中心的距离
+            if distance >= r:
+                mask[y, x] = 255  # 距离大于 r 的区域设为 255
+
+    return mask
 
 def chamfer_distance_x2y(x, y):
     """
@@ -179,7 +194,7 @@ def project_point_cloud_to_image(points, extrnsics, intrinsic, w=1024, h=1024):
 
     return u[valid_uv], v[valid_uv], z[valid_points][valid_uv]
 
-def dice_loss(pred_maks, gt_maks, eps=1e-6):
+def dice_loss(pred_maks, gt_maks, eps=1e-6, beta=1.5):
     """
     The function calculates the dice loss between the predicted masks and the ground truth masks.
     
@@ -192,29 +207,52 @@ def dice_loss(pred_maks, gt_maks, eps=1e-6):
       A scalar representing the dice loss.
     """
     intersection = torch.sum(pred_maks * gt_maks, dim=(1, 2))
-    union = torch.sum(pred_maks, dim=(1, 2)) + torch.sum(gt_maks, dim=(1, 2))
-    dice_loss = 1 - (2 * intersection + eps) / (union + eps)
+    union = torch.sum(beta * pred_maks, dim=(1, 2)) + torch.sum(gt_maks, dim=(1, 2))
+    dice_loss = 1 - ((1+beta) * intersection + eps) / (union + eps)
     return torch.mean(dice_loss)
 
-def cam_loss(mask, vertices, faces, cameras:camera, bs=1, face_indices=None, sclae=0.25):
-    """
-    It calculates the camera loss based on the given mask, vertices, intrinsic, and extrinsic matrices.
-    
-    Args:
-      mask (torch.Tensor): A binary mask indicating the valid vertices.
-      vertices (torch.Tensor): The 3D vertices of the mesh. (B, 6890, 3)
-      cameras: A kaolin camera object
-    
-    Returns:
-      A scalar representing the camera loss.
-    """
-    # project vertices to image plane
+def reprojection_loss(points, gt_points, cameras:camera, min_margin=5):
+    pred_points = cameras.transform_points_screen(points)[:, :, :2]  # (B, N, 2)
+
+    # Create mask to ignore invalid keypoints
+    valid_mask = (gt_points != -1).all(dim=-1)  # (B, N) -> True for valid keypoints
+
+    # Get valid batch indices (samples with at least one valid keypoint)
+    loss_indices = valid_mask.any(dim=-1).nonzero(as_tuple=True)[0].tolist()  # List of valid batch indices
+
+    # Compute Smooth L1 loss per point (B, N, 2)
+    pointwise_loss = torch.nn.functional.smooth_l1_loss(pred_points, gt_points, reduction='none')  # (B, N, 2)
+
+    # Reduce loss per keypoint (mean over x, y dimensions)
+    pointwise_loss = pointwise_loss.mean(dim=-1)  # (B, N)
+
+    # Apply threshold: ignore small errors
+    pointwise_loss = torch.where(pointwise_loss > min_margin, pointwise_loss, torch.zeros_like(pointwise_loss))
+
+    # Mask invalid points (set their loss to 0)
+    pointwise_loss = pointwise_loss * valid_mask  # (B, N)
+
+    # Compute mean loss per valid sample (B,)
+    per_sample_loss = pointwise_loss.sum(dim=-1) / (valid_mask.sum(dim=-1) + 1e-6)  # Avoid division by zero
+
+    # l2 loss
+    # loss = torch.norm(pred_points - gt_points, dim=-1)  # (N,)
+    # loss = (loss ** 2).mean()
+    # smooth l1 loss
+    # loss = torch.abs(pred_points - gt_points).mean()
+
+    return per_sample_loss, loss_indices
+
+def cam_loss(mask, vertices, faces, cameras:camera, bs=1, face_indices=None, empty_mask=None, scale=0.5):
     sum_loss = []
     loss_dict = []
-    
-    mesh = Meshes(verts=[v for v in vertices], faces=[faces] * len(vertices))
+    if face_indices is not None:
+        mask_vert, maks_face = face_indices
+        mesh = Meshes(verts=[v for v in vertices], faces=[faces[maks_face]] * len(vertices))
+    else:
+        mesh = Meshes(verts=[v for v in vertices], faces=[faces] * len(vertices))
 
-    raster_settings = RasterizationSettings(image_size=512,   # Resolution    
+    raster_settings = RasterizationSettings(image_size=int(cameras.image_size[0][0] * scale),   # Resolution    
                                             blur_radius=0.0,  # No anti-aliasing    
                                             faces_per_pixel=1, # Number of faces to store)
                                             cull_backfaces=True,
@@ -226,11 +264,15 @@ def cam_loss(mask, vertices, faces, cameras:camera, bs=1, face_indices=None, scl
                                 raster_settings=raster_settings)
     sil_renderer = MeshRenderer(rasterizer=rasterizer, 
                                 shader=SoftSilhouetteShader())
-    soft_mask = sil_renderer(mesh)[..., 3] # (B,H, W, 4)
-
+    soft_mask = sil_renderer(mesh)[..., 3] # (B,H, W)
+    if empty_mask is not None:
+        soft_mask[:, empty_mask>0] = 0
+        mask[:,:, empty_mask>0] = 0
+    soft_mask = soft_mask ** 2
     for idx, sf in enumerate(soft_mask):    
         if (mask[idx].sum() > 1000):
-            sum_loss.append(mask_iou(sf.unsqueeze(0), mask[idx:idx+1].sum(dim=1)))
+            # sum_loss.append(mask_iou(sf.unsqueeze(0), mask[idx:idx+1].sum(dim=1)))
+            sum_loss.append(dice_loss(sf.unsqueeze(0), mask[idx:idx+1].sum(dim=1)))
             loss_dict.append(idx)
         # fragments = rasterizer(mesh[idx])
         # faces_idx = fragments.pix_to_face[..., 0] # (1, h, w)
@@ -264,7 +306,7 @@ def cam_loss(mask, vertices, faces, cameras:camera, bs=1, face_indices=None, scl
     #     sum_loss.append(loss)
     #     loss_dict.append(idx)
     
-    return [sum_loss, loss_dict]
+    return sum_loss, loss_dict
 
 
 def show_image_with_uv(u, v, w=1024, h=1024):
@@ -371,7 +413,7 @@ def joints_smooth(joints, mode='XY', weight=None, noise=0.01, framerate=20):
     acc = torch.abs(rel_joints[2:, 1:, select] + rel_joints[:-2,1:,select] - 2 * rel_joints[1:-1,1:,select])
     # acc = robust_filter(acc)
     if weight is not None:
-        loss = acc.reshape(-1, 23, 3).mean(-1) @ torch.from_numpy(weight).to(acc.device)
+        loss = acc.reshape(len(acc), -1, 3).mean(-1)[:, :23] @ torch.from_numpy(weight).to(acc.device)
     else:
         loss = acc.reshape(-1, 23, 3).mean(-1).sum(-1)
     # joints_diffs = torch.norm(rel_joints[:-1, :, select] - joints[1:, :, select], dim =-1)

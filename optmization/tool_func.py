@@ -11,20 +11,27 @@
 # HISTORY:                                                                     #
 ################################################################################
 
-import torch
+import sys
+import time
+import os
+import logging
 
 import numpy as np
-import os
+import torch
+import json
 import torchgeometry as tgm
 import open3d as o3d
-import time
-import logging
-import sys
+import torch.nn.functional as F
+
+from scipy.interpolate import CubicSpline
+from scipy.signal import savgol_filter, gaussian
+from scipy.ndimage import convolve1d
 
 sys.path.append('.')
 sys.path.append('..')
 
-from utils import read_json_file, load_point_cloud, MOCAP_INIT, poses_to_vertices_torch
+from smpl import rotation_matrix_to_axis_angle
+from utils import load_point_cloud, poses_to_vertices_torch
 
 __all__ = ['find_stable_foot', 
            'crop_scene',
@@ -33,13 +40,124 @@ __all__ = ['find_stable_foot',
            'cal_global_trans',
            'get_lidar_to_head',
            'check_nan',
-           'lidar_to_root',
            'log_dict',
            'set_loss_dict',
            'set_foot_states',
            'compute_delta_rt',
            'compute_curvature',
+           'fill_and_smooth_mano_poses',
+           'mask_dict_to_tensor',
+           'get_hand_pose',
+           'get_hand_kpt'
            ]
+
+def read_json_file(file_name):
+    """
+    Reads a json file
+    Args:
+        file_name:
+    Returns:
+    """
+    with open(file_name) as f:
+        try:
+            data = json.load(f)
+        except:
+            data = {}
+    return data
+
+def mask_dict_to_tensor(mask_dict, w, h, scale=0.5):
+    mask = torch.zeros((len(mask_dict), 2, h, w)).type(torch.bool)
+    for idx, (_, v) in enumerate(mask_dict.items()):
+        if 1 in v:  # left hand
+            mask[idx, 0] = torch.from_numpy(v[1])
+        if 2 in v:  # right hand
+            mask[idx, 1] = torch.from_numpy(v[2])
+    return F.interpolate(mask.float(), scale_factor=scale, mode="nearest")
+
+def get_hand_pose(mano_dict, lenght):
+    hand_poses = torch.zeros((lenght, 2, 15, 3))
+    for idx, (_, v) in enumerate(mano_dict.items()):
+        for i, r in enumerate(v['right']):
+            hp = rotation_matrix_to_axis_angle(torch.tensor(v['hand_pose'][i]))
+            if r == 0:
+                hp[:, 1:] *= -1
+            hand_poses[idx][r] = hp
+
+    hand_poses = hand_poses.reshape(-1, 30, 3)
+    # hand_poses = fill_and_smooth_mano_poses(hand_poses)
+    return hand_poses
+
+def get_hand_kpt(det_dict):
+    det = []
+    for k, v in det_dict.items():
+        v0, v1 = v
+        if len(v0) == 0:
+            v[0] = [-1, -1]
+        if len(v1) == 0:
+            v[1] = [-1, -1]
+        det.append(v)
+    det = torch.tensor(det).float()
+    return det
+
+def fill_and_smooth_mano_poses(poses, missing_threshold=0.5, window_size=5, poly_order=2, sigma=1.0, z_thresh=3.0):
+    """
+    Perform outlier detection, interpolation, and smoothing on mano pose data.
+    
+    :param poses: np.array of shape (n, 30, 3), mano pose data
+    :param missing_threshold: If missing frames exceed this ratio, use linear interpolation
+    :param window_size: Window size for Savitzky-Golay filter
+    :param poly_order: Polynomial order for Savitzky-Golay filter
+    :param sigma: Standard deviation for Gaussian filter
+    :param z_thresh: Z-score threshold for detecting outliers
+    :return: Smoothed pose data
+    """
+    poses = np.array(poses)  # Ensure numpy array
+    n_frames, n_joints, dims = poses.shape
+    
+    # 1. Detect missing frames (all-zero frames) and replace them with NaN
+    zero_mask = (poses == 0).all(axis=(1, 2))
+    poses[zero_mask] = np.nan
+    
+    # 2. Detect outliers
+    for j in range(n_joints):
+        for d in range(dims):
+            data = poses[:, j, d]
+            
+            # Compute Z-score to detect outliers
+            mean, std = np.nanmean(data), np.nanstd(data)
+            z_scores = np.abs((data - mean) / std)
+            outliers = z_scores > z_thresh
+            
+            # Set outliers to NaN for interpolation
+            poses[outliers, j, d] = np.nan
+    
+    # 3. Perform interpolation to fill missing values
+    for j in range(n_joints):
+        for d in range(dims):
+            valid_idx = np.where(~np.isnan(poses[:, j, d]))[0]
+            invalid_idx = np.where(np.isnan(poses[:, j, d]))[0]
+            
+            if len(valid_idx) == 0:
+                continue  # Skip if all values are missing
+            
+            if len(valid_idx) < missing_threshold * n_frames:
+                interp_func = CubicSpline(valid_idx, poses[valid_idx, j, d], extrapolate=True)
+                poses[invalid_idx, j, d] = interp_func(invalid_idx)
+            else:
+                poses[invalid_idx, j, d] = np.interp(invalid_idx, valid_idx, poses[valid_idx, j, d])  # Use linear interpolation
+    
+    # 4. Apply Savitzky-Golay filter
+    poses = savgol_filter(poses, window_length=window_size, polyorder=poly_order, axis=0, mode='nearest')
+    
+    # 5. Further smoothing using Gaussian filter
+    gauss_kernel = gaussian(window_size, sigma)
+    gauss_kernel /= gauss_kernel.sum()  # Normalize kernel
+    for j in range(n_joints):
+        for d in range(dims):
+            poses[:, j, d] = convolve1d(poses[:, j, d], gauss_kernel, mode='nearest')
+    
+    return poses
+
 
 def find_stable_foot(smpl_verts, translations, pre_smpl = None, frame_time=0.05, thresh_vel = 5):
     """

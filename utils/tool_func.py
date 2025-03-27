@@ -485,8 +485,10 @@ def poses_to_vertices_torch(poses, trans, batch_size = 128, betas=torch.zeros(10
 
     return vertices, joints, global_rots
 
-def smplh_to_vertices_torch(poses, trans, pose_hand, batch_size = 128, betas=torch.zeros(10), gender='male', is_cuda=True):
+def smplh_to_vertices_torch(poses, trans, pose_hand, batch_size = 128, betas=torch.zeros((1, 10)), gender='male', is_cuda=True):
     assert len(poses) == len(trans)
+    if len(betas) == 1:
+        betas = betas.repeat(len(poses), 1)
     def set_var(vars):
         for i, v in enumerate(vars):  
             if not isinstance(v, torch.Tensor):  
@@ -518,7 +520,8 @@ def smplh_to_vertices_torch(poses, trans, pose_hand, batch_size = 128, betas=tor
         body_pose_world = body_model(root_orient = poses[lb:ub, :3], 
                                      pose_body = poses[lb:ub, 3:66],
                                      trans=trans[lb:ub],
-                                     pose_hand=pose_hand[lb:ub].reshape(-1, 90))
+                                     pose_hand=pose_hand[lb:ub].reshape(-1, 90),
+                                     betas=betas[lb:ub])
         vertices.append(body_pose_world.v)
         joints.append(body_pose_world.Jtr)
 

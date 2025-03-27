@@ -25,32 +25,28 @@ from scipy.spatial.transform import Rotation as R
 from torch.amp.grad_scaler import GradScaler
 import torch.nn.functional as F
 
-from kaolin.render.mesh import camera as opengl_camera
-from pytorch3d.renderer import PerspectiveCameras
 from pytorch3d.utils import cameras_from_opencv_projection
 sys.path.append('.')
 sys.path.append('..')
 
 from wandb_tool import set_wandb, save_wandb, get_weight_loss
 
-from tool_func import loadLogger, load_scene_for_opt, crop_scene, get_lidar_to_head as get_sensor_to_head
-from tool_func import check_nan, log_dict, set_foot_states, cal_global_trans
-
+from tool_func import *
 from losses import *
 
-from smpl import SMPL_Layer, BODY_WEIGHT, BODY_PRIOR_WEIGHT, BODY_PARTS
+from smpl import SMPL_Layer, BODY_WEIGHT, BODY_PRIOR_WEIGHT, BODY_PARTS, SmplParams, load_body_models
 from smpl import convert_to_6D_rot, rot6d_to_rotmat, rotation_matrix_to_axis_angle, rot6d_to_axis_angle
 
 from utils import read_json_file, poses_to_vertices_torch, select_visible_points, multi_func
 
 def get_valid_faces(valid_verts, th_faces):
-
+    valid_verts = list(set(valid_verts))
     valid_verts = torch.tensor(valid_verts, dtype=torch.long, device=th_faces.device)  # Shape: (n)
     valid_faces_mask = torch.isin(th_faces, valid_verts)  # Shape: (num_faces, 3)
     valid_faces = valid_faces_mask.all(dim=-1)  # Shape: (num_faces, ), True if all 3 vertices are valid
     valid_face_indices = torch.nonzero(valid_faces).squeeze()  # Shape: (num_valid_faces, )
 
-    return valid_face_indices
+    return valid_verts, valid_face_indices.tolist()
 
 def get_opt_params(s:int, e:int, params:list, delta_trans=None, return_cameras=True):
     """
@@ -106,62 +102,37 @@ def get_opt_params(s:int, e:int, params:list, delta_trans=None, return_cameras=T
         'mocap_trans':  params['mocap_trans'][s:e].clone(),
         'ori':          convert_to_6D_rot(params['ori'][s:e].clone()),
         'pose':         convert_to_6D_rot(params['pose'][s:e].clone().view(-1, 3)),
+        'hand':         convert_to_6D_rot(params['hand'][s:e].clone().view(-1, 3)),
+        'hand_kpt':     params['hand_kpt'][s:e].clone(),
+        'betas':        params['betas'][s:e].clone(),
         'sensor_traj':  params['sensor_traj'][s:e].clone(),
         'mask':         params['mask'][s:e].clone(),
         'cameras':      cameras
     }
 
-class SmplParams:
-    # Shared parameters across all instances
-    _pose = np.array([])  
-    _trans = np.array([])
-    _betas = np.array([])
-    _gender = 'Neutral'  # Default gender
+def make_smpl_params(human_data, prefix=''):
+    SMPL = SmplParams()
+    if f'{prefix}pose' not in human_data or f'{prefix}hand_pose' not in human_data or f'{prefix}trans' not in human_data:
+        prefix = ''
+        print("opt params doesn't exist!!")
 
-    @classmethod
-    def _ensure_list_or_array(cls, value, name):
-        """Ensures the value is a list or NumPy array."""
-        if isinstance(value, (list, np.ndarray)):
-            return np.array(value) if isinstance(value, list) else value
-        raise TypeError(f"{name} must be a list or NumPy array")
+    SMPL.pose = human_data[f'{prefix}pose'].copy()           # (n, 24, 3)
+    SMPL.trans = human_data[f'{prefix}trans'].copy()  # (n, 3) 
+    if f'{prefix}hand_pose' in human_data:
+        SMPL.hand_pose = human_data[f'{prefix}hand_pose'].copy().reshape(-1, 30, 3).astype(np.float32)    # (n, 30, 3)
+    else:
+        SMPL.hand_pose = np.zeros((len(human_data['trans']), 30, 3)).astype(np.float32)
 
-    @property
-    def pose(self):
-        return SmplParams._pose
+    if 'beta' in human_data:
+        SMPL.betas = np.array(human_data['beta']).reshape(1, -1).astype(np.float32)
+    else:
+        SMPL.betas = np.zeros(10).reshape(1, -1).astype(np.float32)
 
-    @pose.setter
-    def pose(self, value):
-        SmplParams._pose = self._ensure_list_or_array(value, "pose")
-
-    @property
-    def trans(self):
-        return SmplParams._trans
-
-    @trans.setter
-    def trans(self, value):
-        SmplParams._trans = self._ensure_list_or_array(value, "trans")
-
-    @property
-    def betas(self):
-        return SmplParams._betas
-
-    @betas.setter
-    def betas(self, value):
-        SmplParams._betas = self._ensure_list_or_array(value, "betas")
-
-    @property
-    def gender(self):
-        return SmplParams._gender
-
-    @gender.setter
-    def gender(self, value):
-        if value not in {'neutral', 'male', 'female'}:
-            raise ValueError("gender must be 'neutral', 'male', or 'female'")
-        SmplParams._gender = value
-
-    def __repr__(self):
-        return (f"SmplParams(pose={self.pose.tolist()}, trans={self.trans.tolist()}, "
-                f"betas={self.betas.tolist()}, gender='{self.gender}')")
+    if 'gender' in human_data:
+        SMPL.gender = human_data['gender']
+    
+    return SMPL
+    
 
 class Optimizer():
     def __init__(self,
@@ -181,12 +152,13 @@ class Optimizer():
         self.data_length = 0
         self.sensor_frame_rate = 30.0 # frame rate, default is 30.0 fps
 
-        self.SMPL   = SmplParams()
         self.valid_face = []    # valid face positions of the SMPL faces 
         self.synced_data_file = ''
         self.logger = None
         self.mask   = None
         self.human_points = None
+        self.ori_SMPL = None
+        self.opt_SMPL = None
 
         self.stage = {
             "start": 0,        # iters 0-ort,      optimize translation only (contact loss)
@@ -206,9 +178,10 @@ class Optimizer():
         self.radius        = args.radius
         self.shoes_height  = args.shoes_height
         self.name          = args.name
-        self.SMPL.gender   = args.gender
         self.scene         = args.scene
         self.mask_path     = args.mask
+        self.mano_path     = args.mano_file
+        self.kpt_path      = args.kpt_file
 
         # optimization arguments
         self.learn_rate = args.learn_rate
@@ -224,6 +197,7 @@ class Optimizer():
         self.w['jts_smth']   = args.wt_joints_smth
         self.w['pen_loss']   = args.wt_pen_loss
         self.w['mask_loss']  = args.wt_mask_loss
+        self.w['kpt_loss']   = args.wt_kpt_loss
         self.w['l2h']        = args.wt_sensor2head
         self.w['coll']       = args.wt_coll_loss
             
@@ -270,7 +244,7 @@ class Optimizer():
 
         return opt_file, logger_file
 
-    def update_pkl_data(self, opt_data_file, trans, pose, start, end):
+    def update_pkl_data(self, opt_data_file, trans, pose, hand_pose, start, end):
         """
         `update_pkl_data` updates the `synced_data` dictionary with the optimized pose and translation
         parameters, and then saves the updated dictionary to a pickle file
@@ -284,21 +258,24 @@ class Optimizer():
         self.logger.info(f"Updated in: {os.path.basename(opt_data_file)}")
 
         # update original data
-        self.SMPL.trans[start: end] = trans.detach().cpu().numpy()
         if len(pose.shape) >= 3:
             pose = pose.reshape(-1, 3, 3)
             pose = rotation_matrix_to_axis_angle(pose).reshape(-1, 72)
-
-        self.SMPL.pose[start: end] = pose.detach().cpu().numpy()
+        if len(hand_pose.shape) >= 3:
+            hand_pose = hand_pose.reshape(-1, 3, 3)
+            hand_pose = rotation_matrix_to_axis_angle(hand_pose).reshape(-1, 30, 3)
 
         person_data = self.synced_data[self.person]
-
+        if 'hand_pose' not in person_data:
+            person_data['hand_pose'] = self.ori_SMPL.hand_pose.copy()
         if 'opt_pose' not in person_data:
-            person_data['opt_pose']  = self.SMPL.pose
-            person_data['opt_trans'] = self.SMPL.trans
-        else:
-            person_data['opt_pose'][start: end]  = pose.detach().cpu().numpy()
-            person_data['opt_trans'][start: end] = trans.detach().cpu().numpy()
+            person_data['opt_pose']  = self.opt_SMPL.pose
+            person_data['opt_trans'] = self.opt_SMPL.trans
+            person_data['opt_hand_pose'] = self.opt_SMPL.hand_pose.copy()
+
+        person_data['opt_pose'][start: end]  = pose.detach().cpu().numpy()
+        person_data['opt_trans'][start: end] = trans.detach().cpu().numpy()
+        person_data['opt_hand_pose'][start: end] = hand_pose.detach().cpu().numpy()
 
         with open(opt_data_file, 'wb') as f:
             pkl.dump(self.synced_data, f)
@@ -322,6 +299,14 @@ class Optimizer():
             self.mask = pkl.load(f)
             self.logger.info(f'Load mask data in {self.mask_path}')
 
+        with open(self.mano_path, 'rb') as f:
+            self.mano = pkl.load(f)
+            self.logger.info(f'Load mano data in {self.mano_path}')
+
+        with open(self.kpt_path, 'rb') as f:
+            self.det_dict = pkl.load(f)
+            self.logger.info(f'Load hand kpt data in {self.kpt_path}')
+
         human_data             = synced_data[person]
         camera_params          = synced_data[person]['cam_head']
         sensor_traj            = synced_data[person]['lidar_traj'].copy()
@@ -330,26 +315,11 @@ class Optimizer():
         self.sensor_frame_rate = dataset_params['lidar_framerate']
 
         # ==================== the params used to optimize ====================
-        if 'manual_pose' in human_data:
-            self.SMPL.pose = human_data['manual_pose'].copy()    # (n, 24, 3)
-            self.logger.info(f'manual_pose is detected {self.person}')
-        else:
-            self.SMPL.pose = human_data['pose'].copy()           # (n, 24, 3)
+        self.ori_SMPL = make_smpl_params(human_data)
+        self.opt_SMPL = make_smpl_params(human_data, 'opt_')
         self.synced_imu_trans = human_data['mocap_trans'].copy()        # (n, 3)
-
         if 'T_sensor_head' in human_data:
             self.head2sensor = torch.tensor(human_data['T_sensor_head']).float()
-
-        # Transformation from the sensor (camera of lidar)
-        self.SMPL.trans = human_data['trans'].copy()  # (n, 3)   
-
-        if 'beta' in human_data:
-            self.betas = torch.from_numpy(np.array(human_data['beta'])).float()
-        else:
-            self.betas = torch.zeros(10).float()
-
-        if 'gender' in human_data:
-            self.SMPL.gender = human_data['gender']
 
         # ============= define the start and end frames to optimize =============
         self.opt_start  = args.opt_start
@@ -367,8 +337,8 @@ class Optimizer():
             human_data['pose'][self.opt_start: self.opt_end],
             human_data['mocap_trans'][self.opt_start: self.opt_end].copy(),
             1/self.sensor_frame_rate,
-            self.betas,
-            self.SMPL.gender)
+            self.ori_SMPL.betas,
+            self.ori_SMPL.gender)
 
         self.logger.info('[Init] Mocap pose, mocap trans andsensor trajectory ready.')
 
@@ -401,8 +371,12 @@ class Optimizer():
         if end > self.data_length:
             end = self.data_length
 
-        #sensor_ori_params = torch.from_numpy(self.SMPL.trans[start: end, 4:8])
-        trans = torch.from_numpy(self.SMPL.trans[start: end])
+        mask_tensor = mask_dict_to_tensor(self.mask, camera_params['w'], camera_params['h'])
+        if self.mano is not None:
+            self.ori_SMPL.hand_pose[start: end] = get_hand_pose(self.mano, len(mask_tensor))  
+            self.opt_SMPL.hand_pose[start: end] = fill_and_smooth_mano_poses(self.ori_SMPL.hand_pose[start: end])
+        hand_kpt = get_hand_kpt(self.det_dict)
+        self.empty_mask = create_distance_mask(camera_params['w'] //2, camera_params['h']//2)  # the corner of the image is always empty
 
         sensor_t  = np.array([np.eye(4)] * self.data_length)
         sensor_t[:, :3, :3] = R.from_quat(sensor_traj[:, 4:8]).as_matrix()
@@ -411,35 +385,27 @@ class Optimizer():
             
         mocap_trans_params = torch.from_numpy(self.synced_imu_trans[start: end])
 
-        ori_params  = torch.from_numpy(self.SMPL.pose[start: end])[:, :3]
-        pose_params = torch.from_numpy(self.SMPL.pose[start: end])[:, 3:]
+        ori_params  = torch.from_numpy(self.opt_SMPL.pose[start: end])[:, :3]   # (B, 1*3 )
+        pose_params = torch.from_numpy(self.opt_SMPL.pose[start: end])[:, 3:]   # (B, 23*3)
+        hand_params = torch.from_numpy(self.opt_SMPL.hand_pose[start: end])     # (B, 30, 3)
+        trans       = torch.from_numpy(self.opt_SMPL.trans[start: end])         # (B, 3)
+        betas       = torch.from_numpy(self.opt_SMPL.betas).float().repeat(len(trans), 1)
         
-        def mask_dict_to_tensor(mask_dict, w, h, scale=0.5):
-            mask = torch.zeros((len(mask_dict), 2, h, w)).type(torch.bool)
-            for idx, (_, v) in enumerate(mask_dict.items()):
-                if 1 in v:  # left hand
-                    mask[idx, 0] = torch.from_numpy(v[1])
-                if 2 in v:  # right hand
-                    mask[idx, 1] = torch.from_numpy(v[2])
-            return F.interpolate(mask.float(), scale_factor=scale, mode="nearest")
-
-        mask_tensor = mask_dict_to_tensor(self.mask, camera_params['w'], camera_params['h'])
-
         trans.requires_grad              = False
         sensor_t.requires_grad           = False
         mocap_trans_params.requires_grad = False
         ori_params.requires_grad         = False
         pose_params.requires_grad        = False
-        self.betas.requires_grad         = False
         mask_tensor.requires_grad        = False
         self.head2sensor.requires_grad   = False
 
-        self.smpl_layer = SMPL_Layer(gender=self.SMPL.gender)
-        self.valid_face = get_valid_faces(BODY_PARTS['arms'] + BODY_PARTS['hands'], self.smpl_layer.th_faces).tolist()
+        self.smpl_layer = SMPL_Layer(gender=self.opt_SMPL.gender)
+        self.body_model = load_body_models(gender=self.opt_SMPL.gender)
+        self.valid_face = get_valid_faces(BODY_PARTS['arms'] + BODY_PARTS['hands'], self.smpl_layer.th_faces)
 
         if self.is_cuda:
             self.smpl_layer.cuda()
-            self.betas         = self.betas.unsqueeze(0).type(torch.FloatTensor).cuda()
+            self.body_model.cuda()
             mask_tensor        = mask_tensor.type(torch.FloatTensor).cuda()
             self.head2sensor   = self.head2sensor.type(torch.FloatTensor).cuda()
             #sensor_ori_params =sensor_ori_params.type(torch.FloatTensor).cuda()
@@ -448,12 +414,18 @@ class Optimizer():
             mocap_trans_params = mocap_trans_params.type(torch.FloatTensor).cuda()
             ori_params         = ori_params.type(torch.FloatTensor).cuda()
             pose_params        = pose_params.type(torch.FloatTensor).cuda()
+            betas              = betas.type(torch.FloatTensor).cuda()
+            hand_params        = hand_params.type(torch.FloatTensor).cuda()
+            hand_kpt           = hand_kpt.type(torch.FloatTensor).cuda()
 
         #sensor_ori_params
         return {'trans': trans,   # translation from the camera
                 'mocap_trans': mocap_trans_params,  # translation from the imu
                 'ori': ori_params,
                 'pose': pose_params,
+                'hand': hand_params,
+                'betas': betas,
+                'hand_kpt': hand_kpt,
                 'sensor_traj':sensor_t,
                 'mask': mask_tensor,
                 'cameras': {'w': camera_params['w'],
@@ -555,7 +527,7 @@ class Optimizer():
 
         with torch.no_grad():
             smpl_verts, joints, global_rots = poses_to_vertices_torch(
-                smpl_rots, seg_params['trans'], betas=self.betas, gender=self.SMPL.gender)
+                smpl_rots, seg_params['trans'], betas=self.ori_SMPL.betas, gender=self.ori_SMPL.gender)
             lowest_height = torch.min(smpl_verts[:20,:, -1], dim=-1)[0].mean() - self.shoes_height
 
             contact_info = get_contacinfo(
@@ -591,12 +563,19 @@ class Optimizer():
         lfoot_move  = self.lfoot_move[start: end]
         rfoot_move  = self.rfoot_move[start: end]
 
-        smpl_rots  = torch.cat([rot6d_to_rotmat(opt_params['ori']).view(-1, 1, 9),
-                                 rot6d_to_rotmat(opt_params['pose']).view(-1, 23, 9)], dim=1)
+        # smpl_rots  = torch.cat([rot6d_to_rotmat(opt_params['ori']).view(-1, 1, 9),
+        #                          rot6d_to_rotmat(opt_params['pose']).view(-1, 23, 9)], dim=1)
 
-        # todo: 改成 limbs和orientation可以求导，orientation仅绕Z轴方向求导
-        smpl_verts, joints, global_rots = self.smpl_layer(
-            smpl_rots, opt_params['trans'], self.betas)
+        # smpl_verts, joints, global_rots = self.smpl_layer(
+        #     smpl_rots, opt_params['trans'], self.betas)
+        
+        body_pose_world = self.body_model(root_orient = rot6d_to_rotmat(opt_params['ori']).view(-1, 1 * 9), 
+                                          pose_body = rot6d_to_rotmat(opt_params['pose']).view(-1, 23 * 9)[:, :21*9],
+                                          trans=opt_params['trans'],
+                                          pose_hand=rot6d_to_rotmat(opt_params['hand']).view(-1, 30 * 9),
+                                          betas=opt_params['betas'])
+        smpl_verts = body_pose_world.v
+        joints = body_pose_world.Jtr
 
         sum_loss, print_str, loss_chart = 0, [], {}
 
@@ -607,26 +586,30 @@ class Optimizer():
             self.contact_info = get_contacinfo(foot_states, jump_list, scene_grids, smpl_verts)
 
         # =============  0. re-projecting term =====================
-        if self.w['mask_loss'] > 0 and iters >= self.stage['pose']:
-            ll = cam_loss(opt_params['mask'], smpl_verts, self.smpl_layer.th_faces, cameras=opt_params['cameras'], face_indices=self.valid_face)
+        if self.w['mask_loss'] > 0 and iters >= self.stage['proj_only']:
+            ll = cam_loss(opt_params['mask'], smpl_verts, self.smpl_layer.th_faces, cameras=opt_params['cameras'], empty_mask=self.empty_mask, face_indices=self.valid_face)
             sum_loss += add_loss_item(ll, self.w['mask_loss'], 'mask')
+
+        if self.w['kpt_loss'] > 0 and iters >= self.stage['pose']:
+            ll = reprojection_loss(joints[:, 20:22], opt_params['hand_kpt'], opt_params['cameras'])
+            sum_loss += add_loss_item(ll, self.w['kpt_loss'], 'kpt')
 
         # =============  1. scene-aware terms =====================
         # foot contact loss
-        if self.w['ft_cont'] >= 0 and iters >= self.stage['start'] and iters < self.stage['proj_only']:
+        if self.w['ft_cont'] > 0 and iters >= self.stage['start'] and iters < self.stage['proj_only']:
             ll   = contact_constraint(smpl_verts, self.contact_info, self.shoes_height)
             loss = add_loss_item(ll, self.w['ft_cont'], 'cont')
             sum_loss += loss
 
         # body-scene collision loss
-        if self.w['coll'] >= 0 and iters >= self.stage['start'] and iters < self.stage['proj_only']:
+        if self.w['coll'] > 0 and iters >= self.stage['start'] and iters < self.stage['proj_only']:
             sum_loss += add_loss_item(foot_collision(smpl_verts,
                                       self.contact_info), 
                                       self.w['coll'], 'coll')
         # =============  2. scene-aware terms =====================
                 
         # sensor_center_to_head CD loss
-        if self.w['l2h'] >= 0 and self.person == 'first_person' and iters < self.stage['proj_only']:
+        if self.w['l2h'] > 0 and self.person == 'first_person' and iters < self.stage['proj_only']:
             ll = (opt_params['sensor_traj'] @ self.head2sensor)[:, :3, 3] - joints[:, 15]
             loss = torch.abs(ll).sum(-1)
             loss = add_loss_item([torch.abs(ll).sum(-1), 
@@ -638,7 +621,7 @@ class Optimizer():
 
         # =============  3. self-constraint loss =====================
         # self penetration loss
-        # if self.w['pen_loss'] >= 0 and iters >= self.stage['pose']:
+        # if self.w['pen_loss'] > 0 and iters >= self.stage['pose']:
         #     loss = add_loss_item(collision_loss(smpl_verts, 
         #                                         self.smpl_layer.th_faces),
         #                          self.w['pen_loss'], 'pen')
@@ -647,7 +630,7 @@ class Optimizer():
         #         sum_loss += loss
 
         # pose prior (from IMU) loss
-        if self.w['pose_prior'] >= 0 and iters >= self.stage['pose'] and iters < self.stage['proj_only']:
+        if self.w['pose_prior'] > 0 and iters >= self.stage['pose'] and iters < self.stage['proj_only']:
             loss   = torch.sum(torch.abs(opt_params['pose'] - convert_to_6D_rot(
                 init_params['pose'][start:end].view(-1, 3))).view(-1, 23, 6), dim=-1)
             
@@ -662,7 +645,7 @@ class Optimizer():
                 sum_loss += loss
 
         # foot sliding loss
-        if self.w['ft_sld'] >= 0 and iters < self.stage['proj_only']:
+        if self.w['ft_sld'] > 0 and iters < self.stage['proj_only']:
             ll = sliding_constraint(smpl_verts, 
                                     foot_states, 
                                     jump_list, lfoot_move, rfoot_move)
@@ -674,7 +657,7 @@ class Optimizer():
 
         # =============  4. temporal smoothness loss =====================
         # translation smooth loss
-        if self.w['trans_smth'] >= 0 and iters < self.stage['proj_only']:
+        if self.w['trans_smth'] > 0 and iters < self.stage['proj_only']:
             loss = trans_imu_smooth(
                 opt_params['trans'].squeeze(1),
                 jump_list,
@@ -687,14 +670,14 @@ class Optimizer():
                 sum_loss += loss
 
         #  body joints trans smoothness
-        if self.w['jts_smth'] >= 0 and iters >= self.stage['ort'] and iters < self.stage['proj_only']:
+        if self.w['jts_smth'] > 0 and iters >= self.stage['ort'] and iters < self.stage['proj_only']:
             loss = joints_smooth(joints, self.imu_smt_mode, BODY_WEIGHT[1:])
             loss = add_loss_item(
                 [loss, np.arange(2, end - start).tolist()], self.w['jts_smth'], 'jts')
             sum_loss += loss
 
         # global rotation smoothness
-        if self.w['rot_smth'] >= 0 and iters >= self.stage['ort'] and iters < self.stage['proj_only']:
+        if self.w['rot_smth'] > 0 and iters >= self.stage['ort'] and iters < self.stage['proj_only']:
             # loss = joint_orient_error(ori_params[1:], ori_params[:-1])
             loss = torch.mean(
                 torch.abs(opt_params['ori'][0:-1] - opt_params['ori'][1:]), dim=-1)
@@ -705,7 +688,7 @@ class Optimizer():
                 sum_loss += loss
 
         # body pose rotation smoothness
-        if self.w['rot_smth'] >= 0 and iters >= self.stage['ort'] and iters < self.stage['proj_only']:
+        if self.w['rot_smth'] > 0 and iters >= self.stage['ort'] and iters < self.stage['proj_only']:
             # loss = joint_orient_error(ori_params[1:], ori_params[:-1])
             loss = torch.abs(opt_params['pose'].view(-1, 23, 6)
                              [0:-1]-opt_params['pose'].view(-1, 23, 6)[1:]).sum(-1).mean(-1)
@@ -719,7 +702,7 @@ class Optimizer():
         # concancatation loss between two optmization segments
         if sub_seg > 0:
             # concancatation translation loss
-            if self.w['cat_trans'] >= 0 and iters < self.stage['proj_only']:
+            if self.w['cat_trans'] > 0 and iters < self.stage['proj_only']:
                 acc = opt_params['trans'][0] - 2 * \
                     self.pre_sensor_t[1] + self.pre_sensor_t[0]
                 loss1 = torch.nn.functional.relu(torch.norm(acc) - 1e-4)
@@ -734,7 +717,7 @@ class Optimizer():
                     sum_loss += loss
 
             # concancatation sliding loss
-            if self.w['cat_sld'] >= 0 and iters < self.stage['proj_only']:
+            if self.w['cat_sld'] > 0 and iters < self.stage['proj_only']:
                 init_verts = torch.cat((self.pre_verts[-1:], smpl_verts[0:1]))
 
                 loss, _ = sliding_constraint(
@@ -751,7 +734,7 @@ class Optimizer():
                     sum_loss += loss
 
             # concancatation rotation smoothness loss
-            if self.w['cat_rot'] >= 0 and iters >= self.stage['ort'] and iters < self.stage['proj_only']:
+            if self.w['cat_rot'] > 0 and iters >= self.stage['ort'] and iters < self.stage['proj_only']:
                 loss = torch.mean(
                     torch.abs(opt_params['ori'][:1] - self.pre_ori[-1:]), dim=-1)
                 loss = add_loss_item(
@@ -760,7 +743,7 @@ class Optimizer():
                     sum_loss += loss
 
             # concancatation pose smoothness loss
-            if self.w['cat_pose'] >= 0 and iters >= self.stage['ort'] and iters < self.stage['proj_only']:
+            if self.w['cat_pose'] > 0 and iters >= self.stage['ort'] and iters < self.stage['proj_only']:
                 loss = torch.abs(
                     opt_params['pose'][:1*23] - self.pre_pose[-1*23:]).sum(-1).mean()
                 loss = add_loss_item(
@@ -770,9 +753,9 @@ class Optimizer():
                     sum_loss += loss
 
             # concancatation joints smoothness loss
-            if self.w['cat_jts'] >= 0 and iters >= self.stage['ort'] and iters < self.stage['proj_only']:
+            if self.w['cat_jts'] > 0 and iters >= self.stage['ort'] and iters < self.stage['proj_only']:
                 loss = joints_smooth(torch.cat(
-                    [joints[:2], self.pre_joints[-2:]], dim=0), self.imu_smt_mode, BODY_WEIGHT[1:])
+                    [joints[:2, :24], self.pre_joints[-2:]], dim=0), self.imu_smt_mode, BODY_WEIGHT[1:])
                 loss = add_loss_item(
                     [loss, [0, 1]], self.w['cat_jts'], 'jts', True)
 
@@ -826,13 +809,17 @@ class Optimizer():
                 if iters == 0:  # Optimize global translation
                     optimizer = get_optmizer('trans', 
                                              [opt_params['trans']], 
-                                             self.learn_rate)
+                                            #   opt_params['hand'],
+                                            #   opt_params['pose']], 
+                                              self.learn_rate)
+                    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.9)
                     
                 elif iters == self.stage['ort']: # Now optimize global orientation
                     optimizer = get_optmizer('trans / orit',
                                              [opt_params['trans'], 
                                               opt_params['ori']],
                                              self.learn_rate)
+                    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.8)
 
                 elif iters == self.stage['pose']: # Now optimize full SMPL pose
                     optimizer = get_optmizer('trans / orit / pose',
@@ -840,6 +827,7 @@ class Optimizer():
                                               opt_params['ori'], 
                                               opt_params['pose']],
                                              self.learn_rate)
+                    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.8)
 
                 elif iters == self.stage['all_loss']: # Now optimize the pose with all losses
                     optimizer = get_optmizer('trans / orit / pose  with all loss functions', 
@@ -847,10 +835,13 @@ class Optimizer():
                                               opt_params['ori'], 
                                               opt_params['pose']], 
                                              self.learn_rate)
+                    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.8)
+                    
                 elif iters == self.stage['proj_only']: # Now optimize the pose with all losses
                     optimizer = get_optmizer('pose only, for reprojection term only', 
                                             [opt_params['pose']], 
                                             self.learn_rate)
+                    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.8)
                 
                 sum_loss, info, loss_chart = self.get_losses(
                     scene_grids,
@@ -864,14 +855,32 @@ class Optimizer():
                 init_loss_chart = deepcopy(loss_chart) if iters == 0 else init_loss_chart   
 
                 if sum_loss > 0:
-                    scaler.scale(sum_loss).backward()
+                    optimizer.zero_grad()  # Reset gradients
+                    scaler.scale(sum_loss).backward()  # Compute gradients
+                    
+                    # Unscale before updating optimizer
+                    scaler.unscale_(optimizer) 
+
                     scaler.step(optimizer)
                     scaler.update()
-                    if abs(pre_loss - sum_loss.item()) < 1e-7:
+                    scheduler.step()
+
+                    current_loss = sum_loss.item()
+
+                    if abs(pre_loss - current_loss) < 1e-7:
                         count += 1
                     else:
                         count = 0
-                    pre_loss = sum_loss.item()
+                    
+                    if count >= 5:  # Adjust learning rate if loss stagnates
+                        prev_lr = optimizer.param_groups[0]['lr']
+                        for param_group in optimizer.param_groups:
+                            param_group['lr'] *= 0.8  # Custom strategy (halving the learning rate)
+                        new_lr = optimizer.param_groups[0]['lr']
+                        print(f"Iteration {iters} - Adjusting LR: {prev_lr} -> {new_lr}")
+                        count = 0  # 重置 count，避免频繁触发
+
+                    pre_loss = current_loss
                 else:
                     count = 0
                 
@@ -884,6 +893,7 @@ class Optimizer():
 
                 if check_nan(ori=opt_params['ori'], 
                              pose=opt_params['pose'], 
+                             hand=opt_params['hand'], 
                              trans=opt_params['trans']):
                     count = 100
                 else:
@@ -891,6 +901,7 @@ class Optimizer():
                     params['mocap'] = opt_params['mocap_trans'].clone().detach()
                     params['ori']   = opt_params['ori'].clone().detach()
                     params['pose']  = opt_params['pose'].clone().detach()
+                    params['hand']  = opt_params['hand'].clone().detach()
 
                 iters += 1
 
@@ -905,12 +916,21 @@ class Optimizer():
 
                     smpl_rots = torch.cat([rot6d_to_rotmat(params['ori']).view(-1, 1, 9),
                                             rot6d_to_rotmat(params['pose']).view(-1, 23, 9)], dim=1)
+                    out_hand_pose = rot6d_to_rotmat(params['hand']).view(-1, 30, 9)
 
                     self.pre_sensor_t = params['trans'][-2:]
-                    self.pre_ori     = params['ori'][-2:]
-                    self.pre_pose    = params['pose'][-2*23:]
-                    self.pre_verts, self.pre_joints, _ \
-                        = self.smpl_layer(smpl_rots[-2:], self.pre_sensor_t, self.betas)
+                    self.pre_ori      = params['ori'][-2:]
+                    self.pre_pose     = params['pose'][-2*23:]
+                    # self.pre_verts, self.pre_joints, _ \
+                    #     = self.smpl_layer(smpl_rots[-2:], self.pre_sensor_t, opt_params['betas'][0].clone().detach())
+                    
+                    bp = self.body_model(root_orient = rot6d_to_rotmat(params['ori']).view(-1, 1*9)[-2:], 
+                                          pose_body = rot6d_to_rotmat(params['pose']).view(-1, 23 * 9)[-2:, :21*9],
+                                          trans=self.pre_sensor_t,
+                                          pose_hand=out_hand_pose.view(-1, 30 * 9)[-2:],
+                                          betas=opt_params['betas'][-2:].clone().detach())
+                    self.pre_verts = bp.v
+                    self.pre_joints = bp.Jtr
 
                     self.logger.info(info)
 
@@ -925,7 +945,7 @@ class Optimizer():
                                       rot6d_to_axis_angle(params['ori']),
                                       init_params['ori'][start:end])
 
-            self.update_pkl_data(opt_data_file, opt_params['trans'], smpl_rots, start + self.opt_start, end + self.opt_start)
+            self.update_pkl_data(opt_data_file, params['trans'], smpl_rots, out_hand_pose, start + self.opt_start, end + self.opt_start)
 
             self.logger.info(
                 '================================================================')
@@ -933,7 +953,7 @@ class Optimizer():
         if self.person == 'first_person':
             try:
                 loss_trans = cal_global_trans(
-                    self.SMPL.pose, self.SMPL.trans)
+                    self.ori_SMPL.pose, self.ori_SMPL.trans)
                 self.logger.info(f'opt localization loss: {loss_trans:.3f}')
             except Exception as e:
                 self.logger.warning(f'{e.args[0]}')
@@ -952,11 +972,11 @@ def config_parser(is_optimization=False):
         parser.add_argument("--radius",              type=float, default=0.6)
         parser.add_argument("--shoes_height",        type=float, default=0.00)
         parser.add_argument("-PS", "--plane_thresh", type=float, default=0.01)
-        parser.add_argument("--window_frames",       type=int, default=500,
+        parser.add_argument("--window_frames",       type=int, default=250,
                             help="window of the frame to be used")
 
         # Optimization parameters - global
-        parser.add_argument("--iterations",     type=int,   default=350)
+        parser.add_argument("--iterations",     type=int,   default=200)
         parser.add_argument("--learn_rate",     type=float, default=0.005)
 
         parser.add_argument("--wt_ft_sliding",  type=float, default=400)
@@ -970,6 +990,8 @@ def config_parser(is_optimization=False):
         parser.add_argument("--wt_sensor2head", type=float, default=500)
         parser.add_argument("--wt_coll_loss",   type=float, default=200)
         parser.add_argument("--wt_mask_loss",   type=float, default=10,
+                            help= "body-scene collision loss weight")
+        parser.add_argument("--wt_kpt_loss",   type=float, default=1,
                             help= "body-scene collision loss weight")
         parser.add_argument("--wt_pen_loss",    type=float, default=60, 
                             help= 'self-penetration loss')
@@ -1030,6 +1052,12 @@ if __name__ == '__main__':
     
     parser.add_argument("--mask", type=str, default='/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd/recording_head/mask_imgs_1049_1990.pkl', 
                         help="Path to the mask file")
+    
+    parser.add_argument("--mano_file", type=str, default='/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd/recording_head/mano_imgs_1049_1990.pkl', 
+                        help="Path to the mask file")
+    
+    parser.add_argument("--kpt_file", type=str, default='/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd/recording_head/det_hand_imgs_1049_1990.pkl', 
+                        help="Path to the mask file")
 
     args = parser.parse_args()
 
@@ -1047,6 +1075,6 @@ if __name__ == '__main__':
         logger_file = os.path.join(args.root_folder, 'log', args.logger_file)
 
         print('====== Run second person optimization ======')
-        optimizer = Optimizer(person='second_person')
+        optimizer = Optimizer(person='first_person')
         opt_file, _ = optimizer.set_args(args, opt_file, logger_file)
         optimizer.run(opt_file)
