@@ -323,20 +323,24 @@ body_idx = {
     'hips' : [1, 2],
     'knees': [4, 5],
     'foot' : [7, 8],
-    'ends' : [10, 11, 22, 23]
+    'ends' : [10, 11, 22, 23],
+    'lhand' : [22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36],
+    'rhand' : [37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51]
 }
 
-body_weight = np.asarray([1.] * 24).astype('float32')
+body_weight = np.asarray([1.] * 52).astype('float32')
 body_weight[body_idx['neck']]  = 0.8
 body_weight[body_idx['head']]  = 0.8
 body_weight[body_idx['shold']] = 0.8
 body_weight[body_idx['u_arm']] = 0.5
-body_weight[body_idx['hands']] = 0.1
+body_weight[body_idx['hands']] = 0.5
 body_weight[body_idx['torso']] = 1.0
 body_weight[body_idx['hips']]  = 0.8
 body_weight[body_idx['knees']] = 0.4
 body_weight[body_idx['foot']]  = 0.1
 body_weight[body_idx['ends']]  = 0.1
+body_weight[body_idx['lhand']]  = 0.2
+body_weight[body_idx['rhand']]  = 0.2
 
 body_prior_weight = np.asarray([1.] * 24).astype('float32')
 body_prior_weight[body_idx['head']]  = 5

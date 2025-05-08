@@ -25,10 +25,10 @@ sys.path.append('..')
 
 from smpl import SMPL_Layer, load_body_models, SmplParams, rotation_matrix_to_axis_angle
 from utils import smplh_to_vertices_torch, Renderer
-from optmization import fill_and_smooth_mano_poses, get_hand_pose
+from optmization import fill_and_smooth_mano_poses, get_hand_pose, fit_trajectory_with_confidence
 
-LIGHT_RED=(1.0,  0.35686275,  0.31372549)
-LIGHT_BLUE=(0.2, 0.6, 1.0)
+LIGHT_RED=(0.31372549, 0.35686275, 1.0)
+LIGHT_BLUE=(1.0, 0.6, 0.2)
 
 def get_black_mask_r(img, threshold=10, kernel_size=(5, 5)):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -71,6 +71,15 @@ def print_key_functions():
     print("p or 112 - Perform inference, update mask, and save mask")
     print("s or 114 - Save the current mask")
     print("v or 118 - Start video recording and save current frame")
+
+def add_points(img, keypoints, size = 8, color = (0, 200, 0), ratio=0.6):
+        # 解析关键点并绘制
+    for point in keypoints:
+        if ratio is not None:
+            if point[-1] <= ratio:
+                continue
+        x, y = map(int, point[:2])  # 取前两个值 (x, y)
+        cv2.circle(img, (x, y), 8, color, -1)  # 画红色点
 
 def init_predictor(img_dir):
     current_dir = os.path.dirname(os.path.realpath(__file__))
@@ -137,7 +146,9 @@ class ImageAnnotator:
 
         self.image_list, self.img_folder = copy_images(img_folder, start, end)        
         self.index = 0  
-        self.max_index = 250
+        self.max_index = -1
+        if self.max_index <=0:
+            self.max_index = len(self.image_list)
 
         # load prompt if it exists
         prompt_file = os.path.join(os.path.dirname(self.img_folder), 
@@ -146,6 +157,8 @@ class ImageAnnotator:
                                  f"mask_{os.path.basename(self.img_folder)}.pkl")
         mano_file = os.path.join(os.path.dirname(self.img_folder), 
                                  f"mano_{os.path.basename(self.img_folder)}.pkl")
+        kpt_file  = os.path.join(os.path.dirname(self.img_folder), 
+                                 f"kpts_{os.path.basename(self.img_folder)}.pkl")
         
         if os.path.exists(pkl_file):
             with open(pkl_file, 'rb') as f:
@@ -153,7 +166,19 @@ class ImageAnnotator:
         else:
             synced_data = {}
 
+        with open(kpt_file, 'rb') as f:
+            self.det_dict = pickle.load(f)
 
+            x, y = (self.det_dict[..., 0].copy(), self.det_dict[..., 1].copy())
+
+            self.det_dict[..., 0] = 1024 - y
+            self.det_dict[..., 1] = x
+
+            self.det_dict_smooth = self.det_dict.copy()
+
+            for i in [7, 8, 9, 10, -42, -21]:
+                self.det_dict_smooth[:, i], _ = fit_trajectory_with_confidence(self.det_dict_smooth[:, i], 0.5, max_gap=10, is_show=False, enable_filling=False)
+            print(f'Load hand kpt data in {kpt_file}')
 
         self.proj_img_list = []
         self.proj_img_list2 = []
@@ -181,6 +206,7 @@ class ImageAnnotator:
 
         if 'hand_pose' in human_data:
             SMPL.hand_pose = human_data['hand_pose'].copy().astype(np.float32)    # (n, 30, 3)
+            print('get hand pose')
         else:
             SMPL.hand_pose = np.zeros((len(human_data['trans']), 30, 3))
             with open(mano_file, 'rb') as f:
@@ -188,6 +214,7 @@ class ImageAnnotator:
             SMPL.hand_pose[start: end] = get_hand_pose(mano_data, len(self.image_list))
         if 'opt_hand_pose' in human_data:
             opt_hand_pose = torch.tensor(human_data['opt_hand_pose'][start: end]).float()
+            print('get opt_hand_pose')
         else:
             opt_hand_pose = torch.tensor(fill_and_smooth_mano_poses(SMPL.hand_pose[start: end])).float()
 
@@ -218,11 +245,10 @@ class ImageAnnotator:
         ori_params  = torch.from_numpy(SMPL.pose[start: end])[:, :3]
         pose_params = torch.from_numpy(SMPL.pose[start: end])[:, 3:]
         
-        smpl_layer = SMPL_Layer(gender=SMPL.gender)
+        self.faces = SMPL_Layer(gender=SMPL.gender).th_faces
         body_model = load_body_models(gender=SMPL.gender)
 
         if True:
-            smpl_layer.cuda()
             body_model.cuda()
             betas              = betas.unsqueeze(0).type(torch.FloatTensor).cuda()
             trans              = trans.type(torch.FloatTensor).cuda()
@@ -246,48 +272,18 @@ class ImageAnnotator:
         }
         # cameras setting
         ex = torch.tensor(params['cameras']['extrinsic']).float()   # (B, 4, 4)
-        image_size  = torch.tensor([[params['cameras']['h'], params['cameras']['w']]] * len(ex))
         f = torch.tensor([params['cameras']['intrinsic'][:2]] * len(ex)).float()
-        c = torch.tensor([params['cameras']['intrinsic'][2:]] * len(ex)).float()
         K = torch.tensor([[
             [params['cameras']['intrinsic'][0], 0, params['cameras']['intrinsic'][2]],
             [0, params['cameras']['intrinsic'][1], params['cameras']['intrinsic'][3]],
             [0, 0, 1]
             ]] * len(ex))
-        cameras = cameras_from_opencv_projection(R=ex[:, :3, :3].cuda(), tvec=ex[:, :3, 3].cuda(), 
-                                                 image_size=image_size.cuda(), 
-                                                 camera_matrix=K.cuda())
-        smpl_verts, _ = smplh_to_vertices_torch(SMPL.pose[start: end], trans, hand_pose, betas=betas, gender=SMPL.gender)
-        smpl_verts_2, _ = smplh_to_vertices_torch(opt_pose, opt_trans, opt_hand_pose, betas=betas, gender=SMPL.gender)
+        self.cam = {'ex': ex, 'w': camera_params['w'], 'h': camera_params['h'], 'f': f, 'K': K}
+        self.smpl = smplh_to_vertices_torch(SMPL.pose[start: end], trans, hand_pose, betas=betas, gender=SMPL.gender)
+        self.smpl2 = smplh_to_vertices_torch(opt_pose, opt_trans, opt_hand_pose, betas=betas, gender=SMPL.gender)
         self.empty_mask = create_distance_mask(camera_params['w'], camera_params['h'])
         
-        render = Renderer(resolution=(camera_params['w'], camera_params['h']), wireframe=True)
-
-        for idx, verts in tqdm(enumerate(smpl_verts[:self.max_index]), total=self.max_index, desc="Renderring verts"):
-
-            img = render.render(
-                np.zeros((camera_params['w'], camera_params['h'], 4)),
-                smpl_model    = (verts.cpu(), smpl_layer.th_faces.cpu()),
-                cam           = (camera_params['intrinsic'], ex[idx].cpu()),
-                color         = LIGHT_BLUE,
-                human_pc      = None,
-                sence_pc_pose = None,
-                mesh_filename = None,
-                a=1)
-
-            img2 = render.render(
-                np.zeros((camera_params['w'], camera_params['h'], 4)),
-                smpl_model    = (smpl_verts_2[idx].cpu(), smpl_layer.th_faces.cpu()),
-                cam           = (camera_params['intrinsic'], ex[idx].cpu()),
-                color         = LIGHT_RED,
-                human_pc      = None,
-                sence_pc_pose = None,
-                mesh_filename = None,
-                a=1)
-            
-            self.proj_img_list.append(img)
-            self.proj_img_list2.append(img2)
-        # =================================================================
+        self.render = Renderer(resolution=(camera_params['w'], camera_params['h']), wireframe=True)
 
         if os.path.exists(prompt_file):
             with open(prompt_file, 'rb') as f:
@@ -332,9 +328,39 @@ class ImageAnnotator:
         """显示图片，并在顶部绘制文件名，如果有mask，则叠加mask"""
         img_display = self.img.copy()
         fname = self.image_list[self.index]
-        proj_img = self.proj_img_list[self.index]
-        proj_img2 = self.proj_img_list2[self.index]
+        # proj_img = self.proj_img_list[self.index]
+        # proj_img2 = self.proj_img_list2[self.index]
 
+        idx = self.index
+        img = self.render.render(
+            np.zeros((self.cam['w'], self.cam['h'], 4)),
+            smpl_model    = (self.smpl[0][idx].cpu(), self.faces),
+            cam           = (self.cam['K'][idx], self.cam['ex'][idx].cpu()),
+            color         = LIGHT_BLUE,
+            human_pc      = None,
+            sence_pc_pose = None,
+            mesh_filename = None,
+            a=1)
+        p3d = (self.cam['ex'][idx][:3, :3] @ self.smpl[1][idx].cpu().T).T + self.cam['ex'][idx][:3, 3]
+        p2d = ((self.cam['K'][idx] @ p3d.T).T)[18:22]
+        p2d /= p2d[..., -1:]
+        add_points(img, p2d, color=[i*255 for i in LIGHT_BLUE])
+
+        img2 = self.render.render(
+            np.zeros((self.cam['w'], self.cam['h'], 4)),
+            smpl_model    = (self.smpl2[0][idx].cpu(), self.faces),
+            cam           = (self.cam['K'][idx], self.cam['ex'][idx].cpu()),
+            color         = LIGHT_RED,
+            human_pc      = None,
+            sence_pc_pose = None,
+            mesh_filename = None,
+            a=1)
+        
+        p3d = (self.cam['ex'][idx][:3, :3] @ self.smpl2[1][idx].cpu().T).T + self.cam['ex'][idx][:3, 3]
+        p2d = ((self.cam['K'][idx] @ p3d.T).T)[18:22]
+        p2d /= p2d[..., -1:]
+        add_points(img2, p2d, color=[i*255 for i in LIGHT_RED])
+        
         if fname in self.mask_dict:
             colormap = cm.get_cmap("tab10")
             for obj_id, mask in self.mask_dict[fname].items():
@@ -351,8 +377,12 @@ class ImageAnnotator:
                     cv2.circle(img_display, tuple(point), 5
                                , color.tolist(), -1)
         
-        img_display = cv2.addWeighted(img_display, 1.0, cv2.rotate(proj_img[:, :, :3], cv2.ROTATE_90_CLOCKWISE), 1.0, 0)
-        img_display = cv2.addWeighted(img_display, 1.0, cv2.rotate(proj_img2[:, :, :3], cv2.ROTATE_90_CLOCKWISE), 1.0, 0)
+        img_display = cv2.addWeighted(img_display, 1.0, cv2.rotate(img[:, :, :3], cv2.ROTATE_90_CLOCKWISE), 1.0, 0)
+        img_display = cv2.addWeighted(img_display, 1.0, cv2.rotate(img2[:, :, :3], cv2.ROTATE_90_CLOCKWISE), 1.0, 0)
+        # add_points(img_display, self.det_dict[self.index][[7, 8, 9, 10, -42, -21]])
+        add_points(img_display, self.det_dict_smooth[self.index][[7, 8, 9, 10]], color=(200, 0, 0))
+        add_points(img_display, self.det_dict_smooth[self.index][[-42, -21]])
+
         img_display[self.empty_mask > 0] = 0
         cv2.putText(img_display, fname, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         if view:
@@ -459,7 +489,7 @@ class ImageAnnotator:
 # 用法示例
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pkl_path", type=str, default='/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd/log/2025-03-27T01:04:12_.pkl', help="Path to the pkl file")
+    parser.add_argument("--pkl_path", type=str, default='/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd/log/2025-05-08T17:39:21_.pkl', help="Path to the pkl file")
     parser.add_argument("--img_folder", type=str, default='/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd/recording_head/imgs', help="Path to the image folder")
 
     parser.add_argument("-S", "--start", type=int, default=1049,

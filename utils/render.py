@@ -81,7 +81,13 @@ class Renderer:
         # Camera
         (cam_intrinsics, cam_pose) = cam
         cam_pose = extrinsic_to_cam(cam_pose)
-        fx, fy, cx, cy = cam_intrinsics
+        if cam_intrinsics.shape == (3, 3):
+            fx = cam_intrinsics[0, 0]
+            fy = cam_intrinsics[1, 1]
+            cx = cam_intrinsics[0, 2]
+            cy = cam_intrinsics[1, 2]
+        else:
+            fx, fy, cx, cy = cam_intrinsics
         camera = IntrinsicsCamera(
             fx=fx, fy=fy, 
             cx=cx, cy=cy,

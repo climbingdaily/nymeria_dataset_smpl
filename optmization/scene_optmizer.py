@@ -166,7 +166,7 @@ class Optimizer():
             "ort": 50,         # iters ort->pose,  optimize +orientation (+rot, joints loss)
             "pose": 90,        # iters > pose,     optimize +pose (+pose, coll, pen, prior)
             "all_loss": 140,   # iters > all_loss, all loss are activated( + p2m)
-            "proj_only": 200,   # iters > all_loss, all loss are activated( + p2m)
+            "proj_only": 250,   # iters > all_loss, all loss are activated( + p2m)
         }
 
     def set_args(self, args, opt_file=None, logger_file=None):
@@ -179,9 +179,21 @@ class Optimizer():
         self.shoes_height  = args.shoes_height
         self.name          = args.name
         self.scene         = args.scene
-        self.mask_path     = args.mask
-        self.mano_path     = args.mano_file
-        self.kpt_path      = args.kpt_file
+
+        self.logger, logger_time, logger_file = loadLogger(os.path.join(
+            self.root_folder, 'log'), work_file=logger_file, name=self.name)
+        
+        with open(args.mask, 'rb') as f:
+            self.mask = pkl.load(f)
+            self.logger.info(f'Load mask data in {args.mask}')
+
+        with open(args.mano_file, 'rb') as f:
+            self.mano = pkl.load(f)
+            self.logger.info(f'Load mano data in {args.mano_file}')
+
+        with open(args.kpt_file, 'rb') as f:
+            self.det_dict = pkl.load(f)
+            self.logger.info(f'Load hand kpt data in {args.kpt_file}')
 
         # optimization arguments
         self.learn_rate = args.learn_rate
@@ -207,8 +219,6 @@ class Optimizer():
         self.w['cat_jts']    = args.cat_joints_weight
         self.w['cat_trans']  = args.cat_trans_weight
 
-        self.logger, logger_time, logger_file = loadLogger(os.path.join(
-            self.root_folder, 'log'), work_file=logger_file, name=self.name)
 
         if opt_file is not None:
             self.synced_data_file = opt_file
@@ -295,18 +305,6 @@ class Optimizer():
             synced_data = pkl.load(f)
             self.logger.info(f'Load data in {self.synced_data_file}')
 
-        with open(self.mask_path, 'rb') as f:
-            self.mask = pkl.load(f)
-            self.logger.info(f'Load mask data in {self.mask_path}')
-
-        with open(self.mano_path, 'rb') as f:
-            self.mano = pkl.load(f)
-            self.logger.info(f'Load mano data in {self.mano_path}')
-
-        with open(self.kpt_path, 'rb') as f:
-            self.det_dict = pkl.load(f)
-            self.logger.info(f'Load hand kpt data in {self.kpt_path}')
-
         human_data             = synced_data[person]
         camera_params          = synced_data[person]['cam_head']
         sensor_traj            = synced_data[person]['lidar_traj'].copy()
@@ -375,7 +373,7 @@ class Optimizer():
         if self.mano is not None:
             self.ori_SMPL.hand_pose[start: end] = get_hand_pose(self.mano, len(mask_tensor))  
             self.opt_SMPL.hand_pose[start: end] = fill_and_smooth_mano_poses(self.ori_SMPL.hand_pose[start: end])
-        hand_kpt = get_hand_kpt(self.det_dict)
+        hand_kpt, _ = get_hand_kpt(self.det_dict, threshold=0.5, enable_filling=False)
         self.empty_mask = create_distance_mask(camera_params['w'] //2, camera_params['h']//2)  # the corner of the image is always empty
 
         sensor_t  = np.array([np.eye(4)] * self.data_length)
@@ -390,6 +388,7 @@ class Optimizer():
         hand_params = torch.from_numpy(self.opt_SMPL.hand_pose[start: end])     # (B, 30, 3)
         trans       = torch.from_numpy(self.opt_SMPL.trans[start: end])         # (B, 3)
         betas       = torch.from_numpy(self.opt_SMPL.betas).float().repeat(len(trans), 1)
+        hand_kpt    = torch.from_numpy(hand_kpt)         # (B, 3)
         
         trans.requires_grad              = False
         sensor_t.requires_grad           = False
@@ -402,6 +401,8 @@ class Optimizer():
         self.smpl_layer = SMPL_Layer(gender=self.opt_SMPL.gender)
         self.body_model = load_body_models(gender=self.opt_SMPL.gender)
         self.valid_face = get_valid_faces(BODY_PARTS['arms'] + BODY_PARTS['hands'], self.smpl_layer.th_faces)
+        self.valid_face_l = get_valid_faces(BODY_PARTS['left_arm'], self.smpl_layer.th_faces)
+        self.valid_face_r = get_valid_faces(BODY_PARTS['right_arm'], self.smpl_layer.th_faces)
 
         if self.is_cuda:
             self.smpl_layer.cuda()
@@ -586,13 +587,27 @@ class Optimizer():
             self.contact_info = get_contacinfo(foot_states, jump_list, scene_grids, smpl_verts)
 
         # =============  0. re-projecting term =====================
-        if self.w['mask_loss'] > 0 and iters >= self.stage['proj_only']:
-            ll = cam_loss(opt_params['mask'], smpl_verts, self.smpl_layer.th_faces, cameras=opt_params['cameras'], empty_mask=self.empty_mask, face_indices=self.valid_face)
-            sum_loss += add_loss_item(ll, self.w['mask_loss'], 'mask')
+        # if self.w['mask_loss'] > 0 and iters >= self.stage['all_loss']:
+        #     ll = cam_loss(opt_params['mask'][:, :1], smpl_verts, self.smpl_layer.th_faces, 
+        #                   cameras=opt_params['cameras'], empty_mask=self.empty_mask, face_indices=self.valid_face_l)
+        #     sum_loss += add_loss_item(ll, self.w['mask_loss'], 'lmask')
+        #     ll = cam_loss(opt_params['mask'][:, 1:2], smpl_verts, self.smpl_layer.th_faces, 
+        #                   cameras=opt_params['cameras'], empty_mask=self.empty_mask, face_indices=self.valid_face_r)
+        #     sum_loss += add_loss_item(ll, self.w['mask_loss'], 'rmask')
 
         if self.w['kpt_loss'] > 0 and iters >= self.stage['pose']:
-            ll = reprojection_loss(joints[:, 20:22], opt_params['hand_kpt'], opt_params['cameras'])
-            sum_loss += add_loss_item(ll, self.w['kpt_loss'], 'kpt')
+            ll = reprojection_loss(joints[:, 20:22], opt_params['hand_kpt'][:, 2:4], opt_params['cameras'], max_margin=100)
+            sum_loss += add_loss_item(ll, self.w['kpt_loss'] * 0.05, 'kpt_hand')
+            ll = reprojection_loss(joints[:, 34:37], opt_params['hand_kpt'][:, 6:9], opt_params['cameras'], max_margin=100)
+            sum_loss += add_loss_item(ll, self.w['kpt_loss'], 'kpt_lt') # left thumb
+            ll = reprojection_loss(joints[:, 22:25], opt_params['hand_kpt'][:, 9:12], opt_params['cameras'], max_margin=100)
+            sum_loss += add_loss_item(ll, self.w['kpt_loss'], 'kpt_lif') # left index finger
+            ll = reprojection_loss(joints[:, 49:52], opt_params['hand_kpt'][:, 21:24], opt_params['cameras'], max_margin=100)
+            sum_loss += add_loss_item(ll, self.w['kpt_loss'], 'kpt_rt') # right thumb
+            ll = reprojection_loss(joints[:, 37:40], opt_params['hand_kpt'][:, 24:27], opt_params['cameras'], max_margin=100)
+            sum_loss += add_loss_item(ll, self.w['kpt_loss'], 'kpt_rif') # right index finger
+            # ll = reprojection_loss(joints[:, 18:20], opt_params['hand_kpt'][:, 0:2], opt_params['cameras'], max_margin=30, thresh_ratio=0.7)
+            # sum_loss += add_loss_item(ll, self.w['kpt_loss'] * 0.2, 'kpt_el')
 
         # =============  1. scene-aware terms =====================
         # foot contact loss
@@ -621,13 +636,12 @@ class Optimizer():
 
         # =============  3. self-constraint loss =====================
         # self penetration loss
-        # if self.w['pen_loss'] > 0 and iters >= self.stage['pose']:
-        #     loss = add_loss_item(collision_loss(smpl_verts, 
-        #                                         self.smpl_layer.th_faces),
-        #                          self.w['pen_loss'], 'pen')
+        if self.w['pen_loss'] > 0 and iters >= self.stage['pose']:
+            loss = add_loss_item(collision_loss(smpl_verts, self.smpl_layer.th_faces),
+                                 self.w['pen_loss'], 'pen')
 
-        #     if iters >= self.stage['pose'] and self.w['pen_loss'] > 0:
-        #         sum_loss += loss
+            if iters >= self.stage['pose'] and self.w['pen_loss'] > 0:
+                sum_loss += loss
 
         # pose prior (from IMU) loss
         if self.w['pose_prior'] > 0 and iters >= self.stage['pose'] and iters < self.stage['proj_only']:
@@ -637,7 +651,8 @@ class Optimizer():
             # loss = torch.mean(loss, dim=-1)
             loss   = (loss @ torch.from_numpy(BODY_PRIOR_WEIGHT[1:]).to(loss.device)) / 23
 
-            weight = 1 if 'first' in self.person else 0.97 ** (iters - self.stage['pose'])
+            # weight = 1 if 'first' in self.person else 0.97 ** (iters - self.stage['pose'])
+            weight = 0.99 ** (iters - self.stage['pose'])
             loss   = add_loss_item(
                 [loss, np.arange(end - start).tolist()], self.w['pose_prior'] * weight, 'prior')
 
@@ -694,6 +709,17 @@ class Optimizer():
                              [0:-1]-opt_params['pose'].view(-1, 23, 6)[1:]).sum(-1).mean(-1)
             loss = add_loss_item(
                 [loss, np.arange(1, end - start).tolist()], self.w['rot_smth'], 'pose')
+
+            if iters > self.stage['cont'] and self.w['rot_smth'] > 0:
+                sum_loss += loss
+
+        # hand pose rotation smoothness
+        if self.w['rot_smth'] > 0 and iters >= self.stage['ort'] and iters < self.stage['proj_only']:
+            # loss = joint_orient_error(ori_params[1:], ori_params[:-1])
+            loss = torch.abs(opt_params['hand'].view(-1, 30, 6)
+                             [0:-1]-opt_params['hand'].view(-1, 30, 6)[1:]).sum(-1).mean(-1)
+            loss = add_loss_item(
+                [loss, np.arange(1, end - start).tolist()], self.w['rot_smth'], 'hpose')
 
             if iters > self.stage['cont'] and self.w['rot_smth'] > 0:
                 sum_loss += loss
@@ -755,7 +781,7 @@ class Optimizer():
             # concancatation joints smoothness loss
             if self.w['cat_jts'] > 0 and iters >= self.stage['ort'] and iters < self.stage['proj_only']:
                 loss = joints_smooth(torch.cat(
-                    [joints[:2, :24], self.pre_joints[-2:]], dim=0), self.imu_smt_mode, BODY_WEIGHT[1:])
+                    [joints[:2, ], self.pre_joints[-2:]], dim=0), self.imu_smt_mode, BODY_WEIGHT[1:])
                 loss = add_loss_item(
                     [loss, [0, 1]], self.w['cat_jts'], 'jts', True)
 
@@ -809,7 +835,8 @@ class Optimizer():
                 if iters == 0:  # Optimize global translation
                     optimizer = get_optmizer('trans', 
                                              [opt_params['trans']], 
-                                            #   opt_params['hand'],
+                                            #   [opt_params['hand'],
+                                            #    opt_params['ori'],
                                             #   opt_params['pose']], 
                                               self.learn_rate)
                     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.9)
@@ -825,6 +852,7 @@ class Optimizer():
                     optimizer = get_optmizer('trans / orit / pose',
                                              [opt_params['trans'], 
                                               opt_params['ori'], 
+                                              opt_params['hand'], 
                                               opt_params['pose']],
                                              self.learn_rate)
                     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.8)
@@ -833,13 +861,16 @@ class Optimizer():
                     optimizer = get_optmizer('trans / orit / pose  with all loss functions', 
                                              [opt_params['trans'], 
                                               opt_params['ori'], 
+                                              opt_params['hand'], 
                                               opt_params['pose']], 
                                              self.learn_rate)
                     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.8)
                     
                 elif iters == self.stage['proj_only']: # Now optimize the pose with all losses
                     optimizer = get_optmizer('pose only, for reprojection term only', 
-                                            [opt_params['pose']], 
+                                            [opt_params['pose'],
+                                              opt_params['ori'],
+                                             opt_params['hand']], 
                                             self.learn_rate)
                     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.8)
                 
@@ -871,14 +902,13 @@ class Optimizer():
                         count += 1
                     else:
                         count = 0
-                    
-                    if count >= 5:  # Adjust learning rate if loss stagnates
-                        prev_lr = optimizer.param_groups[0]['lr']
-                        for param_group in optimizer.param_groups:
-                            param_group['lr'] *= 0.8  # Custom strategy (halving the learning rate)
-                        new_lr = optimizer.param_groups[0]['lr']
-                        print(f"Iteration {iters} - Adjusting LR: {prev_lr} -> {new_lr}")
-                        count = 0  # 重置 count，避免频繁触发
+                    # if count >= 5:  # Adjust learning rate if loss stagnates
+                        # prev_lr = optimizer.param_groups[0]['lr']
+                        # for param_group in optimizer.param_groups:
+                        #     param_group['lr'] *= 0.8  # Custom strategy (halving the learning rate)
+                        # new_lr = optimizer.param_groups[0]['lr']
+                        # print(f"Iteration {iters} - Adjusting LR: {prev_lr} -> {new_lr}")
+                        # count = 0  # 重置 count，避免频繁触发
 
                     pre_loss = current_loss
                 else:
@@ -905,7 +935,7 @@ class Optimizer():
 
                 iters += 1
 
-                if count > 10 or iters >= self.iterations:
+                if count > 5 or iters >= self.iterations:
 
                     save_wandb(raw_loss,
                                init_loss_chart,
@@ -947,8 +977,7 @@ class Optimizer():
 
             self.update_pkl_data(opt_data_file, params['trans'], smpl_rots, out_hand_pose, start + self.opt_start, end + self.opt_start)
 
-            self.logger.info(
-                '================================================================')
+            self.logger.info('================================================================')
 
         if self.person == 'first_person':
             try:
@@ -976,7 +1005,7 @@ def config_parser(is_optimization=False):
                             help="window of the frame to be used")
 
         # Optimization parameters - global
-        parser.add_argument("--iterations",     type=int,   default=200)
+        parser.add_argument("--iterations",     type=int,   default=250)
         parser.add_argument("--learn_rate",     type=float, default=0.005)
 
         parser.add_argument("--wt_ft_sliding",  type=float, default=400)
@@ -989,11 +1018,11 @@ def config_parser(is_optimization=False):
         parser.add_argument("--wt_pose_prior",  type=float, default=500)
         parser.add_argument("--wt_sensor2head", type=float, default=500)
         parser.add_argument("--wt_coll_loss",   type=float, default=200)
-        parser.add_argument("--wt_mask_loss",   type=float, default=10,
+        parser.add_argument("--wt_mask_loss",   type=float, default=100,
                             help= "body-scene collision loss weight")
         parser.add_argument("--wt_kpt_loss",   type=float, default=1,
                             help= "body-scene collision loss weight")
-        parser.add_argument("--wt_pen_loss",    type=float, default=60, 
+        parser.add_argument("--wt_pen_loss",    type=float, default=300, 
                             help= 'self-penetration loss')
 
         parser.add_argument("--imu_smt_mode",   type=str, default='XYZ', 
@@ -1056,7 +1085,7 @@ if __name__ == '__main__':
     parser.add_argument("--mano_file", type=str, default='/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd/recording_head/mano_imgs_1049_1990.pkl', 
                         help="Path to the mask file")
     
-    parser.add_argument("--kpt_file", type=str, default='/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd/recording_head/det_hand_imgs_1049_1990.pkl', 
+    parser.add_argument("--kpt_file", type=str, default='/home/guest/Documents/Nymeria/20231222_s1_kenneth_fischer_act7_56uvqd/recording_head/kpts_imgs_1049_1990.pkl', 
                         help="Path to the mask file")
 
     args = parser.parse_args()

@@ -22,8 +22,8 @@ import json
 import torchgeometry as tgm
 import open3d as o3d
 import torch.nn.functional as F
-
-from scipy.interpolate import CubicSpline
+import matplotlib.pyplot as plt
+from scipy.interpolate import CubicSpline, splprep, splev
 from scipy.signal import savgol_filter, gaussian
 from scipy.ndimage import convolve1d
 
@@ -48,7 +48,8 @@ __all__ = ['find_stable_foot',
            'fill_and_smooth_mano_poses',
            'mask_dict_to_tensor',
            'get_hand_pose',
-           'get_hand_kpt'
+           'get_hand_kpt',
+           'fit_trajectory_with_confidence'
            ]
 
 def read_json_file(file_name):
@@ -87,17 +88,189 @@ def get_hand_pose(mano_dict, lenght):
     # hand_poses = fill_and_smooth_mano_poses(hand_poses)
     return hand_poses
 
-def get_hand_kpt(det_dict):
-    det = []
-    for k, v in det_dict.items():
-        v0, v1 = v
-        if len(v0) == 0:
-            v[0] = [-1, -1]
-        if len(v1) == 0:
-            v[1] = [-1, -1]
-        det.append(v)
-    det = torch.tensor(det).float()
-    return det
+def detect_outliers_by_velocity(x_seg, y_seg, ind_seg, window_size=5, sigma_threshold=2.0):
+    """
+    Detects outliers based on frame-aware velocity.
+    
+    Parameters:
+    - x_seg, y_seg: x and y coordinates of the segment
+    - ind_seg: Frame indices (not uniform)
+    - window_size: Number of neighboring points for local statistics
+    - sigma_threshold: Outlier threshold based on std dev
+
+    Returns:
+    - outlier_indices: Indices of detected outliers within this segment
+    """
+    num_points = len(x_seg)
+    if num_points < 3:
+        return []
+
+    # Compute time-aware velocities
+    delta_t = np.diff(ind_seg)  # Frame index differences
+    delta_x = np.diff(x_seg)
+    delta_y = np.diff(y_seg)
+    velocity = np.sqrt(delta_x**2 + delta_y**2) / delta_t  # Velocity (Δdistance / Δtime)
+
+    # Compute rolling mean and std deviation of velocity
+    local_means = np.array([np.mean(velocity[max(0, i - window_size): i + 1]) for i in range(len(velocity))])
+    local_stds = np.array([np.std(velocity[max(0, i - window_size): i + 1]) for i in range(len(velocity))])
+
+    # Outlier detection: velocity > (mean + threshold * std)
+    outlier_mask = velocity > (local_means + sigma_threshold * local_stds)
+
+    # Shift because np.diff affects next point
+    outlier_indices = np.where(outlier_mask)[0] + 1  
+
+    return outlier_indices
+
+def fit_trajectory_with_confidence(points, confidence_threshold=0.5, smoothing=10, max_gap=30, alpha=0.1, enable_filling=True, is_show=False):
+    """
+    Fit a 2D trajectory using B-spline smoothing with confidence-based filtering and adaptive smoothing.
+
+    Parameters:
+    - points: (N, 3) NumPy array containing (x, y, confidence)
+    - confidence_threshold: Points with confidence below this value are ignored (default: 0.5)
+    - base_smoothing: Base smoothing factor (default: 5)
+    - max_gap: Maximum allowed gap between frames before splitting (default: 30 frames)
+    - alpha: Scaling factor for smoothing adjustment (default: 0.1)
+
+    Returns:
+    - all_x_smooth, all_y_smooth: List of smoothed trajectory segments
+    - processed_data: (N, 3) array of retained points
+    """
+
+    num_points = len(points)
+    indices = np.arange(num_points)  # Frame indices as time
+
+    # Step 1: Filter out low-confidence points
+    valid_mask = (points[:, 2] > confidence_threshold) & (points[:, 1] > 0) & (points[:, 0] > 0) 
+    valid_data = points[valid_mask]
+    valid_indices = indices[valid_mask]
+
+    if len(valid_data) < 2:
+        raise ValueError("Not enough valid points for B-spline fitting!")
+
+    x, y = valid_data[:, 0], valid_data[:, 1]
+
+    processed_data = points.copy()
+
+    # Step 2: Find large gaps and split into segments
+    gaps = np.diff(valid_indices)  # Compute gaps between consecutive valid frames
+    split_indices = np.where(gaps > max_gap)[0] + 1  # Find large gaps
+
+    ind_segments = np.split(valid_indices, split_indices)
+    x_segments = np.split(x, split_indices)
+    y_segments = np.split(y, split_indices)
+
+    fitted_indices = []
+
+    if is_show:
+        plt.figure(figsize=(10, 10))
+        plt.scatter(points[:, 0], points[:, 1], c=points[:, 2], s=30, cmap='coolwarm', edgecolors='k', marker='x', label="Original Points")
+    # Step 3: Fit B-spline to each segment
+    for _, (x_seg, y_seg, ind_seg) in enumerate(zip(x_segments, y_segments, ind_segments)):
+        start, end = (ind_seg[0], ind_seg[-1])
+        ids = np.arange(start, end+1)
+        outliers = detect_outliers_by_velocity(x_seg, y_seg, ind_seg)
+        nonoutlier = np.setdiff1d(np.arange(len(x_seg)), outliers)
+
+        outliers = np.setdiff1d(ids, ind_seg[nonoutlier])  # Keep only valid points
+
+        if len(ind_seg) <= 4:
+            continue  # Skip tiny segments
+        # Compute average distance between consecutive points
+        avg_distance = np.mean(np.sqrt(np.diff(x_seg)**2 + np.diff(y_seg)**2))
+        
+        # Adjust smoothing dynamically
+        adaptive_s = smoothing * (1 + avg_distance)  # Higher avg_distance → lower s, and vice versa
+        
+        tck, _ = splprep([x_seg[nonoutlier], y_seg[nonoutlier]], u=ind_seg[nonoutlier], s=adaptive_s)
+
+        # Generate smooth trajectory for this segment
+        if len(outliers) > 0:
+            x_smooth, y_smooth = splev(outliers, tck)
+            processed_data[outliers, 2] = 0
+
+            if enable_filling:
+                valid_fit = (x_smooth > 0) & (y_smooth > 0)
+                processed_data[outliers[valid_fit], 0] = x_smooth[valid_fit]
+                processed_data[outliers[valid_fit], 1] = y_smooth[valid_fit]
+                processed_data[outliers[valid_fit], 2] = 0.51
+                fitted_indices.append(outliers[valid_fit])
+
+            if is_show:
+                plt.scatter(processed_data[indices, 0], processed_data[indices, 1], 
+                            c=processed_data[indices, 2], cmap='coolwarm', edgecolors='k', marker='o', 
+                            label="Processed Points (Retained + Interpolated)")
+
+                # Draw lines connecting original to processed points
+                for i in outliers[valid_fit]:
+                    plt.plot([points[i, 0], processed_data[i, 0]],  # X-coordinates
+                            [points[i, 1], processed_data[i, 1]],  # Y-coordinates
+                            'gray', linestyle='--', alpha=0.6)   # Dashed gray lines for visibility
+                    
+                plt.plot(processed_data[start:end, 0], processed_data[start:end, 1], 'r--', label=f"B-Spline Fit")
+                
+    if is_show:
+        plt.gca().invert_yaxis()  
+
+        plt.colorbar(label="Confidence")
+        plt.legend()
+        plt.xlabel("X (pixels)")
+        plt.ylabel("Y (pixels)")
+        plt.title("Trajectory Fitting with Index-Based Interpolation")
+        plt.show()
+    return processed_data, fitted_indices
+
+def get_hand_kpt(keypoints, window_size=5, threshold=0.5, enable_filling=False, is_show=False):
+    keypoint_names = ['Left Elbow', 'Right Elbow', 'Left Wrist', 'Right Wrist']
+    coco_elbow = [7, 8]
+    coco_wrist = [9, 10]
+    coco_hand_0 = [91, 112]
+    # coco_left = [92, 93, 94, 96, 97, 98, 100, 101, 102, 104, 105, 106, 108, 109, 110]
+    # coco_right = [113, 114, 115, 117, 118, 119, 121, 122, 123, 125, 126, 127, 129, 130, 131]
+    coco_left = [92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106]
+    coco_right = [113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127]
+    keypoint_ids = coco_elbow + coco_wrist + coco_hand_0 + coco_left + coco_right
+    # 选取手肘和手腕关键点
+    selected_kpts = keypoints[:, keypoint_ids, :].astype(float)
+    
+    # 过滤置信度低的关键点，将 x, y 设为 -1，置信度设为 0
+    # mask = selected_kpts[:, :, 2] <= threshold
+    # selected_kpts[mask] = [-1, -1, 0]
+    
+    # 统计每个关键点被拟合的次数
+    num_filled_per_kpt = np.zeros(4, dtype=int)
+
+    smoothed_kpts = np.copy(selected_kpts)
+    for i in range(smoothed_kpts.shape[1]):
+        smoothed_kpts[:, i], _ = fit_trajectory_with_confidence(smoothed_kpts[:, i], 0.5, max_gap=10, enable_filling=enable_filling, is_show=is_show)
+    
+    if is_show:
+        # 可视化关键点轨迹，分别绘制原始和优化后的数据
+        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+        
+        for i in range(smoothed_kpts.shape[1]):
+            original_points = selected_kpts[:, i, :2]
+            smoothed_points = smoothed_kpts[:, i, :2]
+            
+            original_valid = original_points[(original_points>0).all(axis=1)]
+            smoothed_valid = smoothed_points[(smoothed_points>0).all(axis=1)]
+            
+            axes[0].plot(original_valid[:, 0], original_valid[:, 1], linestyle='dashed', label=f'{keypoint_names[i]} (Original)')
+            axes[1].plot(smoothed_valid[:, 0], smoothed_valid[:, 1], linestyle='dashed', label=f'{keypoint_names[i]} (Smoothed)')
+        
+        for ax, title in zip(axes, ['Original Keypoints', 'Smoothed Keypoints']):
+            ax.set_xlabel('X Coordinate')
+            ax.set_ylabel('Y Coordinate')
+            ax.legend()
+            ax.set_title(title)
+            ax.axis('equal')  # 保持画布1:1比例
+        
+        plt.suptitle(f'Keypoint Trajectories (Filled Points per Keypoint: {num_filled_per_kpt})')
+        plt.show()
+    
+    return smoothed_kpts, num_filled_per_kpt
 
 def fill_and_smooth_mano_poses(poses, missing_threshold=0.5, window_size=5, poly_order=2, sigma=1.0, z_thresh=3.0):
     """

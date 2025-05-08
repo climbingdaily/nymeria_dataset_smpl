@@ -194,7 +194,7 @@ def project_point_cloud_to_image(points, extrnsics, intrinsic, w=1024, h=1024):
 
     return u[valid_uv], v[valid_uv], z[valid_points][valid_uv]
 
-def dice_loss(pred_maks, gt_maks, eps=1e-6, beta=1.5):
+def dice_loss(pred_maks, gt_maks, eps=1e-6, beta=1):
     """
     The function calculates the dice loss between the predicted masks and the ground truth masks.
     
@@ -211,23 +211,24 @@ def dice_loss(pred_maks, gt_maks, eps=1e-6, beta=1.5):
     dice_loss = 1 - ((1+beta) * intersection + eps) / (union + eps)
     return torch.mean(dice_loss)
 
-def reprojection_loss(points, gt_points, cameras:camera, min_margin=5):
-    pred_points = cameras.transform_points_screen(points)[:, :, :2]  # (B, N, 2)
+def reprojection_loss(points, gt_points, cameras:camera, min_margin=5, max_margin=500, thresh_ratio=0.5):
+    pred_points = cameras.transform_points_screen(points)  # (B, N, 3)
+    ratio = gt_points[..., 2]
+
+    # Compute Smooth L1 loss per point (B, N, 2)
+    pointwise_loss = torch.nn.functional.smooth_l1_loss(pred_points[..., :2], gt_points[..., :2], reduction='none')  # (B, N, 2)
+    pointwise_loss = pointwise_loss.mean(dim=-1)  # (B, N)
+    if gt_points.shape[-1] == 3:
+        pointwise_loss = pointwise_loss * ratio
 
     # Create mask to ignore invalid keypoints
-    valid_mask = (gt_points != -1).all(dim=-1)  # (B, N) -> True for valid keypoints
+    valid_pred_mask = pred_points[..., -1] > 0  # (B, N) 
+    valid_gt_mask = (gt_points > 0).all(dim=-1)  # (B, N) -> True for valid keypoints
+    valid_ratio_mask = ratio > thresh_ratio  # filter ratio < 0.6 的点
+    valid_mask = (valid_gt_mask & valid_pred_mask) & valid_ratio_mask & (pointwise_loss > min_margin) & (pointwise_loss < max_margin)
 
     # Get valid batch indices (samples with at least one valid keypoint)
     loss_indices = valid_mask.any(dim=-1).nonzero(as_tuple=True)[0].tolist()  # List of valid batch indices
-
-    # Compute Smooth L1 loss per point (B, N, 2)
-    pointwise_loss = torch.nn.functional.smooth_l1_loss(pred_points, gt_points, reduction='none')  # (B, N, 2)
-
-    # Reduce loss per keypoint (mean over x, y dimensions)
-    pointwise_loss = pointwise_loss.mean(dim=-1)  # (B, N)
-
-    # Apply threshold: ignore small errors
-    pointwise_loss = torch.where(pointwise_loss > min_margin, pointwise_loss, torch.zeros_like(pointwise_loss))
 
     # Mask invalid points (set their loss to 0)
     pointwise_loss = pointwise_loss * valid_mask  # (B, N)
@@ -241,8 +242,17 @@ def reprojection_loss(points, gt_points, cameras:camera, min_margin=5):
     # smooth l1 loss
     # loss = torch.abs(pred_points - gt_points).mean()
 
-    return per_sample_loss, loss_indices
+    return per_sample_loss[loss_indices], loss_indices
 
+def false_pos_neg_loss(pred, target, alpha=0.5):
+    false_pos = (pred - target).clamp(min=0).mean()  # 预测多余的部分
+    false_neg = (target - pred).clamp(min=0).mean()  # 预测少的部分
+    return alpha * false_pos + (1 - alpha) * false_neg
+def unmatched_area_loss(pred, target):
+    union = pred + target  # A ∪ B
+    intersection = pred * target  # A ∩ B
+    diff = union - 2 * intersection  # 计算 (A ∪ B) - (A ∩ B)
+    return diff.sum()  / (target.sum() + 100)
 def cam_loss(mask, vertices, faces, cameras:camera, bs=1, face_indices=None, empty_mask=None, scale=0.5):
     sum_loss = []
     loss_dict = []
@@ -268,11 +278,12 @@ def cam_loss(mask, vertices, faces, cameras:camera, bs=1, face_indices=None, emp
     if empty_mask is not None:
         soft_mask[:, empty_mask>0] = 0
         mask[:,:, empty_mask>0] = 0
-    soft_mask = soft_mask ** 2
+    # soft_mask = soft_mask ** 2
     for idx, sf in enumerate(soft_mask):    
         if (mask[idx].sum() > 1000):
             # sum_loss.append(mask_iou(sf.unsqueeze(0), mask[idx:idx+1].sum(dim=1)))
-            sum_loss.append(dice_loss(sf.unsqueeze(0), mask[idx:idx+1].sum(dim=1)))
+            # sum_loss.append(dice_loss(sf.unsqueeze(0), mask[idx:idx+1].sum(dim=1)))
+            sum_loss.append(unmatched_area_loss(sf.unsqueeze(0), mask[idx:idx+1].sum(dim=1)))
             loss_dict.append(idx)
         # fragments = rasterizer(mesh[idx])
         # faces_idx = fragments.pix_to_face[..., 0] # (1, h, w)
@@ -411,11 +422,14 @@ def joints_smooth(joints, mode='XY', weight=None, noise=0.01, framerate=20):
         return ratio ** 2 * dist
     
     acc = torch.abs(rel_joints[2:, 1:, select] + rel_joints[:-2,1:,select] - 2 * rel_joints[1:-1,1:,select])
+    acc = acc.reshape(len(acc), -1, 3)
     # acc = robust_filter(acc)
     if weight is not None:
-        loss = acc.reshape(len(acc), -1, 3).mean(-1)[:, :23] @ torch.from_numpy(weight).to(acc.device)
+        if len(weight) < acc.shape[1]:
+            weight = np.concatenate((weight, 0.2 * np.ones(acc.shape[1]-len(weight)))).astype(np.float32)
+        loss = acc.mean(-1)  @ torch.from_numpy(weight).to(acc.device)
     else:
-        loss = acc.reshape(-1, 23, 3).mean(-1).sum(-1)
+        loss = acc.mean(-1).sum(-1)
     # joints_diffs = torch.norm(rel_joints[:-1, :, select] - joints[1:, :, select], dim =-1)
     # loss = F.relu(joints_diffs - noise).mean(dim=-1)
 
@@ -1108,7 +1122,7 @@ def collision_loss(smpl_verts, smpl_faces):
                                BP['left_arm'], BP['right_arm'], both_side=True)
     # hand to body collision
     hb_losses = part_coll_dist(smpl_verts, verts_normals, 
-                               BP['right_arm'] + BP['left_arm'], BP['body'])
+                               BP['right_arm'] + BP['left_arm'], BP['body'], both_side=True)
     # left leg to right leg collisison
     ll_losses = part_coll_dist(smpl_verts, verts_normals, 
                                BP['left_leg'], BP['right_leg'], both_side=True)
