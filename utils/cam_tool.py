@@ -243,7 +243,7 @@ def load_point_cloud(points_path:str, save_pc_path:str, inv_dist_std: float=0.00
     )
     return pcd, points
 
-def project_point_cloud_to_image(points, calib, extrnsics):
+def project_point_cloud_to_image(points, calib, extrnsics, return_index=False):
     w, h  = calib.get_image_size()
     intrinsic_matrix = get_intrinsic_from_calib(calib)
     R = extrnsics[:3, :3].astype(np.float32) # (3, 3)
@@ -258,8 +258,12 @@ def project_point_cloud_to_image(points, calib, extrnsics):
     u, v = uv[0, :] / uv[2, :], uv[1, :] / uv[2, :]
 
     valid_uv = (u > 0) & (u < w) & (v > 0) & (v < h)
-
-    return u[valid_uv], v[valid_uv], z[valid_points][valid_uv]
+    if return_index:
+        valid_index = np.zeros(len(points)).astype(np.bool_)
+        valid_index[np.arange(len(points))[valid_points][valid_uv]] = 1
+        return u[valid_uv], v[valid_uv], z[valid_points][valid_uv], valid_index
+    else:
+        return u[valid_uv], v[valid_uv], z[valid_points][valid_uv]
 
 def remove_further_points_and_color(us, vs, zs, image_width, image_height):
 

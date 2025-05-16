@@ -187,7 +187,7 @@ class ImageAnnotator:
         person = 'first_person'
         human_data             = synced_data[person]
         camera_params          = synced_data[person]['cam_head']
-        sensor_traj            = synced_data[person]['lidar_traj'].copy()
+        sensor_traj            = synced_data[person]['sensor_traj'].copy()
         self.data_length       = len(synced_data['frame_num'])
         # self.frame_time        = synced_data['device_ts']    
         SMPL = SmplParams()
@@ -319,8 +319,8 @@ class ImageAnnotator:
             print(f"Error loading image: {img_path}")
             return  
         
-        # if self.rotate_image:
-        #     self.img = cv2.rotate(self.img, cv2.ROTATE_90_CLOCKWISE)
+        if self.rotate_image:
+            self.img = cv2.rotate(self.img, cv2.ROTATE_90_CLOCKWISE)
         if show:
             return self.show_image(view)
     
@@ -337,9 +337,6 @@ class ImageAnnotator:
             smpl_model    = (self.smpl[0][idx].cpu(), self.faces),
             cam           = (self.cam['K'][idx], self.cam['ex'][idx].cpu()),
             color         = LIGHT_BLUE,
-            human_pc      = None,
-            sence_pc_pose = None,
-            mesh_filename = None,
             a=1)
         p3d = (self.cam['ex'][idx][:3, :3] @ self.smpl[1][idx].cpu().T).T + self.cam['ex'][idx][:3, 3]
         p2d = ((self.cam['K'][idx] @ p3d.T).T)[18:22]
@@ -351,9 +348,6 @@ class ImageAnnotator:
             smpl_model    = (self.smpl2[0][idx].cpu(), self.faces),
             cam           = (self.cam['K'][idx], self.cam['ex'][idx].cpu()),
             color         = LIGHT_RED,
-            human_pc      = None,
-            sence_pc_pose = None,
-            mesh_filename = None,
             a=1)
         
         p3d = (self.cam['ex'][idx][:3, :3] @ self.smpl2[1][idx].cpu().T).T + self.cam['ex'][idx][:3, 3]

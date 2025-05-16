@@ -307,7 +307,7 @@ class Optimizer():
 
         human_data             = synced_data[person]
         camera_params          = synced_data[person]['cam_head']
-        sensor_traj            = synced_data[person]['lidar_traj'].copy()
+        sensor_traj            = synced_data[person]['sensor_traj'].copy()
         self.data_length       = len(synced_data['frame_num'])
         # self.frame_time        = synced_data['device_ts']    
         self.sensor_frame_rate = dataset_params['lidar_framerate']

@@ -27,7 +27,7 @@ def extrinsic_to_cam(extrinsic):
     return cam
 
 class Renderer:
-    def __init__(self, resolution=(1920,1080), wireframe=False):
+    def __init__(self, resolution=(1920,1080), wireframe=False, bg_color=[0.0, 0.0, 0.0, 0.0], ambient_light=(0.3, 0.3, 0.3)):
         self.resolution = resolution
 
         self.wireframe = wireframe
@@ -37,7 +37,7 @@ class Renderer:
         )
 
         # set the scene
-        self.scene = pyrender.Scene(bg_color=[0.0, 0.0, 0.0, 0.0], ambient_light=(0.3, 0.3, 0.3))
+        self.scene = pyrender.Scene(bg_color=bg_color, ambient_light=ambient_light)
 
         light = pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=1)
         light_pose = np.eye(4)

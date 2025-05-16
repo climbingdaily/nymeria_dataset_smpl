@@ -813,32 +813,32 @@ def read_json_file(file_name):
             data = {}
     return data
 
-def compute_traj_params(mocap, lidar, init_params = None):
+def compute_traj_params(mocap, sensor, init_params = None):
     mocap_traj_length = np.linalg.norm(mocap[1:] - mocap[:-1], axis=1).sum()
-    lidar_traj_length = np.linalg.norm(lidar[1:] - lidar[:-1], axis=1).sum()
+    sensor_traj_length = np.linalg.norm(sensor[1:] - sensor[:-1], axis=1).sum()
 
     mocap_XY_length = np.linalg.norm(mocap[1:, :2] - mocap[:-1, :2], axis=1).sum()
-    lidar_XY_length = np.linalg.norm(lidar[1:, :2] - lidar[:-1, :2], axis=1).sum()
+    sensor_XY_length = np.linalg.norm(sensor[1:, :2] - sensor[:-1, :2], axis=1).sum()
 
     mocap_Z_length = abs(mocap[1:, 2] - mocap[:-1, 2]).sum()
-    lidar_Z_length = abs(lidar[1:, 2] - lidar[:-1, 2]).sum()
+    sensor_Z_length = abs(sensor[1:, 2] - sensor[:-1, 2]).sum()
 
     print(f'Mocap traj lenght: {mocap_traj_length:.3f} m')
-    print(f'LiDAR traj lenght: {lidar_traj_length:.3f} m')
+    print(f'Sensor traj lenght: {sensor_traj_length:.3f} m')
     print(f'Mocap XY lenght: {mocap_XY_length:.3f} m')
-    print(f'LiDAR XY lenght: {lidar_XY_length:.3f} m')
+    print(f'Sensor XY lenght: {sensor_XY_length:.3f} m')
     print(f'Mocap Z lenght: {mocap_Z_length:.3f} m')
-    print(f'LiDAR Z lenght: {lidar_Z_length:.3f} m')
+    print(f'Sensor Z lenght: {sensor_Z_length:.3f} m')
     
     if init_params:
-        init_params['lidar_traj_length'] = lidar_traj_length
+        init_params['sensor_traj_length'] = sensor_traj_length
         init_params['mocap_traj_length'] = mocap_traj_length
-        init_params['lidar_XY_length'] = lidar_XY_length
+        init_params['sensor_XY_length'] = sensor_XY_length
         init_params['mocap_XY_length'] = mocap_XY_length
-        init_params['lidar_Z_height'] = lidar_Z_length
+        init_params['sensor_Z_height'] = sensor_Z_length
         init_params['mocap_Z_heitht'] = mocap_Z_length
 
-    return mocap_traj_length, lidar_traj_length, mocap_XY_length, lidar_XY_length, init_params
+    return mocap_traj_length, sensor_traj_length, mocap_XY_length, sensor_XY_length, init_params
 
 class erase_background:
 
